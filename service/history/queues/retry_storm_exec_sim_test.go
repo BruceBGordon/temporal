@@ -58,6 +58,18 @@ type execSimParams struct {
 	sharedAckLimiter bool
 	noise            float64
 	seed             uint64
+
+	// Hypothesis 1: shard reload on ambiguous write errors, redoing work since the last saved
+	// queue position. Grounded in shard.ContextImpl (handleWriteErrorLocked, updateShardInfo,
+	// acquireShard) and queueBase.checkpoint.
+	shardReload            bool
+	shardUpdateMinInterval time.Duration // history.shardUpdateMinInterval
+	shardUpdateMinTasks    int           // history.shardUpdateMinTasksCompleted
+	writeFraction          float64       // ASSUMPTION: share of task executions that are shard writes
+	// apiWrites models the write traffic that creates the tasks: every transfer task is created by a
+	// workflow write through the shard (one write per task, sharing history.persistenceMaxQPS).
+	// An ambiguous error on such a write makes the shard re-acquire, as in handleWriteErrorLocked.
+	apiWrites bool
 }
 
 func defaultExecSimParams() execSimParams {
@@ -80,6 +92,9 @@ func defaultExecSimParams() execSimParams {
 		sharedAckLimiter: true,
 		noise:            0.2,
 		seed:             1,
+
+		shardUpdateMinInterval: 5 * time.Minute,
+		shardUpdateMinTasks:    1000,
 	}
 }
 
@@ -89,13 +104,17 @@ type execSimResult struct {
 	finalOutstanding float64
 	failedCalls      int // persistence calls that failed (reads + executions)
 	execAttempts     int
+	reloads          int // shard re-acquisitions
+	reworkTasks      int // tasks re-read because the saved queue position was behind
+	failedWrites     int // API writes that failed (rejected or ambiguous)
 }
 
 type execEvent struct {
 	at    time.Duration
-	kind  int // 0 read, 1 ack, 2 worker done, 3 reschedule fire
+	kind  int // 0 read, 1 checkpoint, 2 worker done, 3 reschedule fire, 4 shard acquire, 5 API write
 	shard int
 	ex    Executable
+	gen   int // shard generation the event belongs to; stale events are dropped
 	seq   int
 }
 
@@ -130,6 +149,16 @@ type execSim struct {
 	executed   []int
 	retriers   []backoff.Retrier
 	res        execSimResult
+
+	gen               []int
+	exGen             map[Executable]int
+	completed         []int // tasks completed, cumulative
+	persisted         []int // saved queue position, in completed-task units
+	tasksSinceUpdate  []int
+	lastShardUpdate   []time.Duration
+	reloading         []bool
+	checkpointRetrier []backoff.Retrier
+	acquireRetrier    []backoff.Retrier
 }
 
 func (s *execSim) schedule(e execEvent) {
@@ -168,11 +197,14 @@ func (s *execSim) persistenceCall(l *tokenBucket) error {
 
 type simExecutor struct{ s *execSim }
 
-func (x simExecutor) Execute(_ context.Context, _ Executable) ExecuteResponse {
+func (x simExecutor) Execute(_ context.Context, e Executable) ExecuteResponse {
 	x.s.res.execAttempts++
 	err := x.s.persistenceCall(x.s.limiter)
 	if err != nil {
 		x.s.res.failedCalls++
+		if x.s.p.writeFraction > 0 && x.s.rng.Float64() < x.s.p.writeFraction && isAmbiguousWriteError(err) {
+			x.s.startReload(x.s.shardOf[e])
+		}
 	}
 	return ExecuteResponse{ExecutedAsActive: true, ExecutionErr: err}
 }
@@ -188,7 +220,7 @@ func (x simScheduler) TrySubmit(e Executable) bool        { return x.s.enqueue(e
 type simRescheduler struct{ s *execSim }
 
 func (x simRescheduler) Add(e Executable, at time.Time) {
-	x.s.schedule(execEvent{at: max(x.s.now, at.Sub(x.s.t0)), kind: 3, ex: e})
+	x.s.schedule(execEvent{at: max(x.s.now, at.Sub(x.s.t0)), kind: 3, ex: e, gen: x.s.exGen[e]})
 }
 func (x simRescheduler) Reschedule(string) {}
 func (x simRescheduler) Len() int          { return 0 }
@@ -212,8 +244,50 @@ func (s *execSim) enqueue(e Executable, force bool) bool {
 func (s *execSim) done(e Executable) {
 	sh := s.shardOf[e]
 	delete(s.shardOf, e)
+	delete(s.exGen, e)
 	s.loaded[sh]--
 	s.executed[sh]++
+	s.completed[sh]++
+	s.tasksSinceUpdate[sh]++
+}
+
+// stale reports whether e belongs to a shard generation that has since been reloaded.
+func (s *execSim) stale(e Executable) bool {
+	g, ok := s.exGen[e]
+	if !ok {
+		return true
+	}
+	sh, ok := s.shardOf[e]
+	return !ok || g != s.gen[sh]
+}
+
+// isAmbiguousWriteError mirrors shard.ContextImpl.handleWriteErrorLocked: ResourceExhausted means
+// "definitely not written"; Unavailable falls to the default branch and the shard re-acquires.
+func isAmbiguousWriteError(err error) bool {
+	var u *serviceerror.Unavailable
+	return errors.As(err, &u)
+}
+
+// startReload models contextRequestLost: the shard re-acquires; its queues restart from the saved
+// position, so work completed since then is read and executed again.
+func (s *execSim) startReload(sh int) {
+	if !s.p.shardReload || s.reloading[sh] {
+		return
+	}
+	s.reloading[sh] = true
+	s.res.reloads++
+	s.gen[sh]++
+	rework := s.completed[sh] - s.persisted[sh]
+	s.res.reworkTasks += rework
+	s.backlog[sh] += float64(rework + s.loaded[sh]) // in-flight tasks are dropped and re-read too
+	s.completed[sh] = s.persisted[sh]
+	s.loaded[sh], s.executed[sh], s.tasksSinceUpdate[sh] = 0, 0, 0
+	for e, owner := range s.shardOf {
+		if owner == sh {
+			delete(s.shardOf, e)
+		}
+	}
+	s.schedule(execEvent{at: s.now, kind: 4, shard: sh, gen: s.gen[sh]})
 }
 
 func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
@@ -237,6 +311,16 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 		loaded:   make([]int, p.shards),
 		executed: make([]int, p.shards),
 		retriers: make([]backoff.Retrier, p.shards),
+
+		gen:               make([]int, p.shards),
+		exGen:             map[Executable]int{},
+		completed:         make([]int, p.shards),
+		persisted:         make([]int, p.shards),
+		tasksSinceUpdate:  make([]int, p.shards),
+		lastShardUpdate:   make([]time.Duration, p.shards),
+		reloading:         make([]bool, p.shards),
+		checkpointRetrier: make([]backoff.Retrier, p.shards),
+		acquireRetrier:    make([]backoff.Retrier, p.shards),
 	}
 	s.ackLimiter = s.limiter
 	if !p.sharedAckLimiter {
@@ -252,8 +336,14 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 	}
 	for sh := range p.shards {
 		s.retriers[sh] = backoff.NewRetrier(common.CreateReadTaskRetryPolicy(), clock.NewRealTimeSource())
+		s.checkpointRetrier[sh] = backoff.NewRetrier(createCheckpointRetryPolicy(), s.ts)
+		// shard.ContextImpl.acquireShard default policy
+		s.acquireRetrier[sh] = backoff.NewRetrier(backoff.NewExponentialRetryPolicy(time.Second).WithExpirationInterval(5*time.Minute), s.ts)
 		s.schedule(execEvent{at: time.Duration(sh) * time.Millisecond, kind: 0, shard: sh})
 		s.schedule(execEvent{at: p.ackInterval + time.Duration(sh)*time.Millisecond, kind: 1, shard: sh})
+		if p.apiWrites {
+			s.schedule(execEvent{at: time.Duration(sh) * time.Millisecond, kind: 5, shard: sh})
+		}
 	}
 
 	s.res.recoveredAfter = -1
@@ -287,13 +377,16 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 		switch e.kind {
 		case 0: // shard reader
 			sh := e.shard
+			if e.gen != s.gen[sh] || s.reloading[sh] {
+				continue // this reader belongs to a shard generation that was reloaded
+			}
 			if s.loaded[sh]+s.executed[sh] >= p.maxPending {
-				s.schedule(execEvent{at: s.now + p.pollBackoff, kind: 0, shard: sh})
+				s.schedule(execEvent{at: s.now + p.pollBackoff, kind: 0, shard: sh, gen: s.gen[sh]})
 				continue
 			}
 			if err := s.persistenceCall(s.limiter); err != nil {
 				s.res.failedCalls++
-				s.schedule(execEvent{at: s.now + readerRetryDelay(err, s.retriers[sh]), kind: 0, shard: sh})
+				s.schedule(execEvent{at: s.now + readerRetryDelay(err, s.retriers[sh]), kind: 0, shard: sh, gen: s.gen[sh]})
 				continue
 			}
 			s.retriers[sh].Reset()
@@ -302,6 +395,7 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 			for range n {
 				ex := newTask()
 				s.shardOf[ex] = sh
+				s.exGen[ex] = s.gen[sh]
 				s.loaded[sh]++
 				ex.SetScheduledTime(s.ts.Now()) // as ReaderImpl.submit
 				if !sched.TrySubmit(ex) {
@@ -312,17 +406,73 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 			if s.backlog[sh] >= 1 {
 				next = 0
 			}
-			s.schedule(execEvent{at: s.now + s.vary(2*time.Millisecond) + next, kind: 0, shard: sh})
-		case 1: // ack-level advancement
-			if s.persistenceCall(s.ackLimiter) == nil {
-				s.executed[e.shard] = 0
-			} else {
-				s.res.failedCalls++
+			s.schedule(execEvent{at: s.now + s.vary(2*time.Millisecond) + next, kind: 0, shard: sh, gen: s.gen[sh]})
+		case 1: // queueBase.checkpoint
+			sh := e.shard
+			next := s.vary(p.ackInterval)
+			if !s.reloading[sh] {
+				s.executed[sh] = 0                                      // ShrinkSlices: completed tasks leave memory regardless of what follows
+				if err := s.persistenceCall(s.ackLimiter); err != nil { // RangeCompleteHistoryTasks
+					s.res.failedCalls++
+					next = s.checkpointRetrier[sh].NextBackOff(err)
+				} else if s.tasksSinceUpdate[sh] >= p.shardUpdateMinTasks || s.now-s.lastShardUpdate[sh] >= p.shardUpdateMinInterval {
+					// SetQueueState -> updateShardInfo -> UpdateShard
+					if err := s.persistenceCall(s.ackLimiter); err != nil {
+						s.res.failedCalls++
+						next = s.checkpointRetrier[sh].NextBackOff(err)
+						if isAmbiguousWriteError(err) {
+							s.startReload(sh)
+						}
+					} else {
+						s.persisted[sh] = s.completed[sh]
+						s.tasksSinceUpdate[sh] = 0
+						s.lastShardUpdate[sh] = s.now
+						s.checkpointRetrier[sh].Reset()
+					}
+				} else {
+					s.checkpointRetrier[sh].Reset()
+				}
 			}
-			s.schedule(execEvent{at: s.now + s.vary(p.ackInterval), kind: 1, shard: e.shard})
+			s.schedule(execEvent{at: s.now + next, kind: 1, shard: sh})
+		case 5: // a workflow write through the shard (the source of the tasks)
+			sh := e.shard
+			if !s.reloading[sh] {
+				if err := s.persistenceCall(s.limiter); err != nil {
+					s.res.failedWrites++
+					if isAmbiguousWriteError(err) {
+						s.startReload(sh)
+					}
+				}
+			}
+			s.schedule(execEvent{at: s.now + s.vary(time.Duration(float64(time.Second)/p.arrivalPerShard)), kind: 5, shard: sh})
+		case 4: // shard.ContextImpl.acquireShard: GetOrCreateShard, then UpdateShard with a new range ID
+			sh := e.shard
+			if e.gen != s.gen[sh] {
+				continue
+			}
+			err := s.persistenceCall(s.limiter)
+			if err == nil {
+				err = s.persistenceCall(s.limiter)
+			}
+			if err != nil {
+				s.res.failedCalls++
+				delay := s.acquireRetrier[sh].NextBackOff(err)
+				if delay < 0 {
+					delay = 5 * time.Second // acquisition expired: the controller acquires the shard again
+					s.acquireRetrier[sh].Reset()
+				}
+				s.schedule(execEvent{at: s.now + delay, kind: 4, shard: sh, gen: s.gen[sh]})
+				continue
+			}
+			s.acquireRetrier[sh].Reset()
+			s.reloading[sh] = false
+			s.lastShardUpdate[sh] = s.now
+			s.schedule(execEvent{at: s.now, kind: 0, shard: sh, gen: s.gen[sh]})
 		case 2: // a worker finishes running one executable, as FIFOScheduler.executeTask does
 			ex := e.ex
-			if err := ex.Execute(); err != nil {
+			if s.stale(ex) {
+				ex.Cancel()
+			} else if err := ex.Execute(); err != nil {
 				if err = ex.HandleErr(err); err != nil {
 					ex.Nack(err)
 				} else {
@@ -340,9 +490,12 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 				s.enqueue(next, true)
 			}
 		case 3: // rescheduler timer fires, as reschedulerImpl.reschedule does
+			if s.stale(e.ex) {
+				continue
+			}
 			e.ex.SetScheduledTime(s.ts.Now())
 			if !sched.TrySubmit(e.ex) {
-				s.schedule(execEvent{at: s.now + backoff.Jitter(2*time.Second, 0.5), kind: 3, ex: e.ex})
+				s.schedule(execEvent{at: s.now + backoff.Jitter(2*time.Second, 0.5), kind: 3, ex: e.ex, gen: e.gen})
 			}
 		}
 	}
@@ -357,8 +510,8 @@ func formatExecSim(r execSimResult) string {
 	if r.recoveredAfter >= 0 {
 		rec = r.recoveredAfter.Round(time.Millisecond).String()
 	}
-	return fmt.Sprintf("recovered after blip: %-10s peak outstanding: %7.0f  final: %6.0f  failed persistence calls: %7d  execution attempts: %8d",
-		rec, r.peakOutstanding, r.finalOutstanding, r.failedCalls, r.execAttempts)
+	return fmt.Sprintf("recovered after blip: %-10s peak outstanding: %7.0f  final: %6.0f  failed calls: %8d  failed writes: %7d  attempts: %8d  reloads: %4d  rework tasks: %7d",
+		rec, r.peakOutstanding, r.finalOutstanding, r.failedCalls, r.failedWrites, r.execAttempts, r.reloads, r.reworkTasks)
 }
 
 // TestExecRetryStormSim checks the model is calibrated (stable without a blip), then reports
@@ -411,5 +564,58 @@ func TestExecRetryStormSimLong(t *testing.T) {
 		p.blipLength, p.seed, p.horizon = 30*time.Second, seed, time.Hour
 		// Spare capacity is 5%, so the 30s backlog alone needs roughly 30s/0.05 = 10 minutes to drain.
 		t.Log(fmt.Sprintf("95%% / 30s blip / 1h, seed %d: ", seed) + formatExecSim(runExecRetryStormSim(t, p)))
+	}
+}
+
+// TestShardReloadHypothesis tests hypothesis 1: ambiguous write errors (Unavailable) make shards
+// re-acquire and redo work since the last saved queue position, which could sustain an outage.
+// Each configuration must first be stable without a blip. Report-only.
+func TestShardReloadHypothesis(t *testing.T) {
+	configs := []struct {
+		name          string
+		reload        bool
+		writeFraction float64
+	}{
+		{"reload off", false, 0},
+		{"reload on, grounded only", true, 0},
+	}
+	for _, c := range configs {
+		calm := defaultExecSimParams()
+		calm.blipLength, calm.horizon = 0, 30*time.Minute
+		calm.arrivalPerShard = 0.95 * calm.limitPerSec / float64(calm.shards)
+		calm.shardReload, calm.writeFraction, calm.apiWrites = c.reload, c.writeFraction, true
+		calm.arrivalPerShard /= 2 // writes and executions together make up the utilization
+		cr := runExecRetryStormSim(t, calm)
+		stable := cr.finalOutstanding <= float64(4*calm.batchSize*calm.shards)
+		t.Log(fmt.Sprintf("[%s] no blip at 95%%: stable=%v  %s", c.name, stable, formatExecSim(cr)))
+		if !stable {
+			t.Errorf("[%s] model unstable without a blip; skipping its results", c.name)
+			continue
+		}
+		for _, util := range []float64{0.90, 0.95} {
+			for _, blipLen := range []time.Duration{5 * time.Second, 30 * time.Second} {
+				worst, never, reloads, rework := time.Duration(0), 0, 0, 0
+				for seed := uint64(1); seed <= 3; seed++ {
+					p := defaultExecSimParams()
+					p.arrivalPerShard = util * p.limitPerSec / float64(p.shards)
+					p.blipLength, p.seed, p.horizon = blipLen, seed, 30*time.Minute
+					p.shardReload, p.writeFraction, p.apiWrites = c.reload, c.writeFraction, true
+					p.arrivalPerShard /= 2
+					r := runExecRetryStormSim(t, p)
+					if r.recoveredAfter < 0 {
+						never++
+					} else {
+						worst = max(worst, r.recoveredAfter)
+					}
+					reloads += r.reloads
+					rework += r.reworkTasks
+				}
+				t.Log(fmt.Sprintf("[%s] util %.0f%% blip %-4v worst recovery %-12v never(30m) %d/3  reloads %4d  rework tasks %7d",
+					c.name, util*100, blipLen, worst.Round(time.Second), never, reloads, rework))
+				if c.reload && reloads == 0 {
+					t.Errorf("[%s] the reload mechanism never fired; this result says nothing about hypothesis 1", c.name)
+				}
+			}
+		}
 	}
 }
