@@ -1616,15 +1616,52 @@ func (s *ContextImpl) handleWriteErrorLocked(
 	if valid := s.IsValid(); !valid {
 		return err
 	}
+	switch classifyWriteError(err) {
+	case writeSucceeded:
+		return nil
+	case writeOwnershipLost:
+		// Shard is stolen, trigger shutdown of history engine.
+		// Handling of max read level doesn't matter here.
+		_ = s.transition(contextRequestStop{reason: stopReasonOwnershipLost})
+		return err
+	case writeOutcomeUnknown:
+		// We have no idea if the write failed or will eventually make it to persistence. Try to re-acquire
+		// the shard in the background. If successful, we'll get a new RangeID, to guarantee that subsequent
+		// reads will either see that write, or know for certain that it failed. This allows the callers to
+		// reliably check the outcome by performing a read. If we fail, we'll shut down the shard.
+		// Note that reacquiring the shard will cause the max read level to be updated
+		// to the new range (i.e. past newMaxReadLevel).
+		_ = s.transition(contextRequestLost{})
+		return err
+	default:
+		// writeBlindRetryable, writeNotCommitted: no special handling required.
+		return err
+	}
+}
+
+// writeOutcome is what a persistence write error says about whether the write happened.
+type writeOutcome int
+
+const (
+	writeSucceeded writeOutcome = iota
+	// The write can be blindly retried (append history timeout).
+	writeBlindRetryable
+	// The write was definitely not committed.
+	writeNotCommitted
+	// Another host owns the shard.
+	writeOwnershipLost
+	// The write may or may not have been committed; the shard must re-acquire to find out.
+	writeOutcomeUnknown
+)
+
+// classifyWriteError is the decision handleWriteErrorLocked makes, extracted
+// with unchanged behavior so it can be checked against other error rules.
+func classifyWriteError(err error) writeOutcome {
 	switch err.(type) {
 	case nil:
-		// Persistence success: update max read level
-		return nil
-
+		return writeSucceeded
 	case *persistence.AppendHistoryTimeoutError:
-		// append history can be blindly retried
-		return err
-
+		return writeBlindRetryable
 	case *persistence.CurrentWorkflowConditionFailedError,
 		*persistence.WorkflowConditionFailedError,
 		*persistence.WorkflowRunAlreadyExistsError,
@@ -1634,25 +1671,11 @@ func (s *ContextImpl) handleWriteErrorLocked(
 		*serviceerror.ResourceExhausted,
 		*serviceerror.NotFound,
 		*serviceerror.NamespaceNotFound:
-		// Persistence failure that means the write was definitely not committed:
-		// No special handling required for these errors.
-		return err
-
+		return writeNotCommitted
 	case *persistence.ShardOwnershipLostError:
-		// Shard is stolen, trigger shutdown of history engine.
-		// Handling of max read level doesn't matter here.
-		_ = s.transition(contextRequestStop{reason: stopReasonOwnershipLost})
-		return err
-
+		return writeOwnershipLost
 	default:
-		// We have no idea if the write failed or will eventually make it to persistence. Try to re-acquire
-		// the shard in the background. If successful, we'll get a new RangeID, to guarantee that subsequent
-		// reads will either see that write, or know for certain that it failed. This allows the callers to
-		// reliably check the outcome by performing a read. If we fail, we'll shut down the shard.
-		// Note that reacquiring the shard will cause the max read level to be updated
-		// to the new range (i.e. past newMaxReadLevel).
-		_ = s.transition(contextRequestLost{})
-		return err
+		return writeOutcomeUnknown
 	}
 }
 
