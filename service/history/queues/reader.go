@@ -20,6 +20,9 @@ import (
 
 var (
 	throttleRetryDelay = 3 * time.Second
+	// throttleRetryJitterCoefficient spreads throttle delays so that shards hit by the same
+	// persistence blip do not all retry at the same instant.
+	throttleRetryJitterCoefficient = 0.2
 )
 
 type (
@@ -576,9 +579,15 @@ func validateSlicesOrderedDisjoint(
 }
 
 // readerRetryDelay picks how long the reader pauses after it fails to load tasks.
+//
+// Every member of the transient-persistence group (common.IsPersistenceTransientError:
+// ResourceExhausted and Unavailable) gets the throttle delay. Previously only
+// ResourceExhausted did, so a brief Unavailable blip such as a database failover sent every
+// shard's reader to the fast path at once, which could keep persistence saturated after it
+// recovered (issue #11547). The delay is jittered so shards do not retry in lockstep.
 func readerRetryDelay(err error, retrier backoff.Retrier) time.Duration {
-	if common.IsResourceExhausted(err) {
-		return throttleRetryDelay
+	if common.IsPersistenceTransientError(err) {
+		return backoff.Jitter(throttleRetryDelay, throttleRetryJitterCoefficient)
 	}
 	return retrier.NextBackOff(err)
 }
