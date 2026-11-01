@@ -17,9 +17,12 @@ import (
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/definition"
+	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/persistence"
+	persistenceclient "go.temporal.io/server/common/persistence/client"
 	"go.temporal.io/server/common/telemetry"
 	"go.temporal.io/server/service/history/tasks"
 	"go.uber.org/mock/gomock"
@@ -40,21 +43,25 @@ import (
 // pollBackoff 5s, ack interval 30s).
 
 type execSimParams struct {
-	shards           int
-	limitPerSec      float64
-	burst            float64
-	arrivalPerShard  float64
-	batchSize        int
-	maxPending       int
-	pollBackoff      time.Duration
-	idlePoll         time.Duration
-	ackInterval      time.Duration
-	workers          int
-	queueCap         int
-	execTime         time.Duration
-	blipStart        time.Duration
-	blipLength       time.Duration
-	horizon          time.Duration
+	shards          int
+	limitPerSec     float64
+	burst           float64
+	arrivalPerShard float64
+	batchSize       int
+	maxPending      int
+	pollBackoff     time.Duration
+	idlePoll        time.Duration
+	ackInterval     time.Duration
+	workers         int
+	queueCap        int
+	execTime        time.Duration
+	blipStart       time.Duration
+	blipLength      time.Duration
+	horizon         time.Duration
+	// divergeAt > 0 stops a run once outstanding work after the blip exceeds it, and reports the
+	// run as diverged (a separate outcome from "never recovered"): the backlog is growing without
+	// bound and the simulation's memory grows with it.
+	divergeAt        float64
 	sharedAckLimiter bool
 	noise            float64
 	seed             uint64
@@ -75,6 +82,13 @@ type execSimParams struct {
 	// slightly below what the host limiters admit (many hosts share one database). Calls the
 	// limiter admits beyond it time out with DeadlineExceeded. 0 disables.
 	dbCapacity float64
+	// clientRetry adds the persistence client's own retry layer (hypothesis 5).
+	clientRetry bool
+	// healthErrorThreshold > 0 enables the server's health-based adaptive limiter
+	// (client.HealthRequestRateLimiterImpl, history.persistenceDynamicRateLimitingParams; off by
+	// default) with this ErrorThreshold, an operator choice. Everything else uses the real
+	// defaults (dynamicconfig.DefaultDynamicRateLimitingParams). Hypothesis 6.
+	healthErrorThreshold float64
 }
 
 func defaultExecSimParams() execSimParams {
@@ -105,14 +119,17 @@ func defaultExecSimParams() execSimParams {
 
 type execSimResult struct {
 	recoveredAfter   time.Duration // after the blip, until outstanding work is back to baseline; -1 if never
+	divergedAt       time.Duration // when outstanding passed divergeAt (run stopped); 0 if it did not
 	peakOutstanding  float64
 	finalOutstanding float64
 	failedCalls      int // persistence calls that failed (reads + executions)
 	execAttempts     int
-	reloads          int // shard re-acquisitions
-	reworkTasks      int // tasks re-read because the saved queue position was behind
-	failedWrites     int // API writes that failed (rejected or ambiguous)
-	timeouts         int // calls admitted by the limiter that the database timed out
+	reloads          int     // shard re-acquisitions
+	reworkTasks      int     // tasks re-read because the saved queue position was behind
+	failedWrites     int     // API writes that failed (rejected or ambiguous)
+	timeouts         int     // calls admitted by the limiter that the database timed out
+	clientRetries    int     // extra attempts made by the persistence client's own retry layer
+	minMultiplier    float64 // lowest rate multiplier the adaptive limiter reached
 }
 
 type execEvent struct {
@@ -148,14 +165,19 @@ type execSim struct {
 	limiter    *tokenBucket
 	ackLimiter *tokenBucket
 	db         *tokenBucket
-	busy       int
-	waiting    []Executable
-	shardOf    map[Executable]int
-	backlog    []float64
-	loaded     []int
-	executed   []int
-	retriers   []backoff.Retrier
-	res        execSimResult
+	// health signal window (system.persistenceHealthSignalWindowSize = 10s, the same as the
+	// limiter's refresh interval), counted where the metrics client sits: above the rate limiter,
+	// so limiter rejections are recorded calls too.
+	hCalls, hUnhealthy int
+	multiplier         float64
+	busy               int
+	waiting            []Executable
+	shardOf            map[Executable]int
+	backlog            []float64
+	loaded             []int
+	executed           []int
+	retriers           []backoff.Retrier
+	res                execSimResult
 
 	gen               []int
 	exGen             map[Executable]int
@@ -185,8 +207,62 @@ func (s *execSim) inBlip() bool {
 	return s.now >= s.p.blipStart && s.now < s.p.blipStart+s.p.blipLength
 }
 
-// persistenceCall decides the outcome of one persistence call at the current virtual time.
+// persistenceCall is one call through the persistence client stack. With clientRetry, the real
+// retryable client layer (common/persistence/client/factory.go) wraps every call: it retries errors
+// in its own transient group (persistenceclient.IsPersistenceTransientError) under the real policy
+// (common.CreatePersistenceClientRetryPolicy). Approximation: the retry's 50ms wait is not modeled;
+// the extra attempt is charged at the same instant.
 func (s *execSim) persistenceCall(l *tokenBucket) error {
+	err := s.persistenceAttempt(l)
+	if !s.p.clientRetry {
+		return err
+	}
+	r := backoff.NewRetrier(common.CreatePersistenceClientRetryPolicy(), s.ts)
+	for err != nil && persistenceclient.IsPersistenceTransientError(err) {
+		if r.NextBackOff(err) < 0 {
+			break
+		}
+		s.res.clientRetries++
+		err = s.persistenceAttempt(l)
+	}
+	return err
+}
+
+// persistenceAttempt decides the outcome of one attempt at the current virtual time, and records
+// it in the health signal window the way the metrics client does (persistence.isUnhealthyError
+// counts the store's TimeoutError; Unavailable and ResourceExhausted count as healthy).
+func (s *execSim) persistenceAttempt(l *tokenBucket) error {
+	err := s.persistenceOutcome(l)
+	s.hCalls++
+	var te *persistence.TimeoutError
+	if errors.As(err, &te) {
+		s.hUnhealthy++
+	}
+	return err
+}
+
+// refreshHealthLimiter applies HealthRequestRateLimiterImpl.refreshRate's rule with the real
+// default step sizes and bounds: over the error threshold, cut the multiplier by the backoff step
+// (not below the minimum); otherwise raise it by the increase step (not above the maximum).
+func (s *execSim) refreshHealthLimiter() {
+	d := dynamicconfig.DefaultDynamicRateLimitingParams
+	ratio := 0.0
+	if s.hCalls > 0 {
+		ratio = float64(s.hUnhealthy) / float64(s.hCalls)
+	}
+	s.hCalls, s.hUnhealthy = 0, 0
+	if ratio > s.p.healthErrorThreshold {
+		s.multiplier = max(d.RateMultiMin, s.multiplier-d.RateBackoffStepSize)
+	} else if s.multiplier < d.RateMultiMax {
+		s.multiplier = min(d.RateMultiMax, s.multiplier+d.RateIncreaseStepSize)
+	}
+	s.res.minMultiplier = min(s.res.minMultiplier, s.multiplier)
+	s.limiter.rate = s.multiplier * s.p.limitPerSec
+	s.limiter.burst = s.multiplier * s.p.burst
+	s.limiter.tokens = min(s.limiter.tokens, s.limiter.burst)
+}
+
+func (s *execSim) persistenceOutcome(l *tokenBucket) error {
 	switch {
 	case s.inBlip():
 		return serviceerror.NewUnavailable("database failover")
@@ -198,7 +274,9 @@ func (s *execSim) persistenceCall(l *tokenBucket) error {
 		}
 	case s.db != nil && !s.db.take(s.now):
 		s.res.timeouts++
-		return serviceerror.NewDeadlineExceeded("persistence call timed out")
+		// The real stores convert timeouts to persistence.TimeoutError
+		// (nosqlplugin/cassandra/gocql/errors.go ConvertError).
+		return &persistence.TimeoutError{Msg: "persistence call timed out"}
 	}
 	return nil
 }
@@ -271,12 +349,11 @@ func (s *execSim) stale(e Executable) bool {
 	return !ok || g != s.gen[sh]
 }
 
-// isAmbiguousWriteError mirrors shard.ContextImpl.handleWriteErrorLocked: ResourceExhausted means
-// "definitely not written"; Unavailable falls to the default branch and the shard re-acquires.
+// isAmbiguousWriteError is the server's own declared rule, persistence.OperationPossiblySucceeded,
+// which shard.ContextImpl.handleWriteErrorLocked restates: a write error that may have been
+// committed makes the shard re-acquire.
 func isAmbiguousWriteError(err error) bool {
-	var u *serviceerror.Unavailable
-	var d *serviceerror.DeadlineExceeded
-	return errors.As(err, &u) || errors.As(err, &d)
+	return err != nil && persistence.OperationPossiblySucceeded(err)
 }
 
 // startReload models contextRequestLost: the shard re-acquires; its queues restart from the saved
@@ -363,6 +440,11 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 		}
 	}
 
+	s.multiplier, s.res.minMultiplier = 1, 1
+	if p.healthErrorThreshold > 0 {
+		s.schedule(execEvent{at: dynamicconfig.DefaultDynamicRateLimitingParams.RefreshInterval, kind: 6})
+	}
+
 	s.res.recoveredAfter = -1
 	blipEnd := p.blipStart + p.blipLength
 	baseline := 0.0
@@ -390,8 +472,16 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 		} else if p.blipLength > 0 && s.now >= blipEnd && s.res.recoveredAfter < 0 && outstanding <= baseline*1.1+float64(p.batchSize) {
 			s.res.recoveredAfter = s.now - blipEnd
 		}
+		if p.divergeAt > 0 && s.now >= blipEnd && s.res.recoveredAfter < 0 && outstanding > p.divergeAt {
+			s.res.divergedAt = s.now
+			break
+		}
 
 		switch e.kind {
+		case 6: // HealthRequestRateLimiterImpl refresh tick
+			s.refreshHealthLimiter()
+			s.schedule(execEvent{at: s.now + dynamicconfig.DefaultDynamicRateLimitingParams.RefreshInterval, kind: 6})
+			continue
 		case 0: // shard reader
 			sh := e.shard
 			if e.gen != s.gen[sh] || s.reloading[sh] {
@@ -566,8 +656,8 @@ func TestExecRetryStormSimSweep(t *testing.T) {
 				failed += r.failedCalls
 				attempts += r.execAttempts
 			}
-			t.Log(fmt.Sprintf("utilization %.0f%%  blip %-4v  worst recovery %-10v  never recovered %d/3  failed calls %8d  execution attempts %9d",
-				util*100, blipLen, worst.Round(time.Millisecond), never, failed, attempts))
+			t.Logf("utilization %.0f%%  blip %-4v  worst recovery %-10v  never recovered %d/3  failed calls %8d  execution attempts %9d",
+				util*100, blipLen, worst.Round(time.Millisecond), never, failed, attempts)
 		}
 	}
 }
@@ -604,7 +694,7 @@ func TestShardReloadHypothesis(t *testing.T) {
 		calm.arrivalPerShard /= 2 // writes and executions together make up the utilization
 		cr := runExecRetryStormSim(t, calm)
 		stable := cr.finalOutstanding <= float64(4*calm.batchSize*calm.shards)
-		t.Log(fmt.Sprintf("[%s] no blip at 95%%: stable=%v  %s", c.name, stable, formatExecSim(cr)))
+		t.Logf("[%s] no blip at 95%%: stable=%v  %s", c.name, stable, formatExecSim(cr))
 		if !stable {
 			t.Errorf("[%s] model unstable without a blip; skipping its results", c.name)
 			continue
@@ -627,8 +717,8 @@ func TestShardReloadHypothesis(t *testing.T) {
 					reloads += r.reloads
 					rework += r.reworkTasks
 				}
-				t.Log(fmt.Sprintf("[%s] util %.0f%% blip %-4v worst recovery %-12v never(30m) %d/3  reloads %4d  rework tasks %7d",
-					c.name, util*100, blipLen, worst.Round(time.Second), never, reloads, rework))
+				t.Logf("[%s] util %.0f%% blip %-4v worst recovery %-12v never(30m) %d/3  reloads %4d  rework tasks %7d",
+					c.name, util*100, blipLen, worst.Round(time.Second), never, reloads, rework)
 				if c.reload && reloads == 0 {
 					t.Errorf("[%s] the reload mechanism never fired; this result says nothing about hypothesis 1", c.name)
 				}
@@ -662,8 +752,8 @@ func TestTimeoutHypothesis(t *testing.T) {
 			calm.blipLength = 0
 			cr := runExecRetryStormSim(t, calm)
 			if cr.finalOutstanding > float64(4*calm.batchSize*calm.shards) || cr.reloads > 0 {
-				t.Log(fmt.Sprintf("[%s] util %.0f%%: baseline UNSTABLE without a blip (reloads %d, final outstanding %.0f); skipped",
-					name, util*100, cr.reloads, cr.finalOutstanding))
+				t.Logf("[%s] util %.0f%%: baseline UNSTABLE without a blip (reloads %d, final outstanding %.0f); skipped",
+					name, util*100, cr.reloads, cr.finalOutstanding)
 				continue
 			}
 			worst, never, reloads, timeouts := time.Duration(0), 0, 0, 0
@@ -679,8 +769,8 @@ func TestTimeoutHypothesis(t *testing.T) {
 				reloads += r.reloads
 				timeouts += r.timeouts
 			}
-			t.Log(fmt.Sprintf("[%s] util %.0f%%: baseline stable; after 5s blip worst recovery %-8v NEVER RECOVERED(30m) %d/3  reloads %5d  timeouts %8d",
-				name, util*100, worst.Round(time.Second), never, reloads, timeouts))
+			t.Logf("[%s] util %.0f%%: baseline stable; after 5s blip worst recovery %-8v NEVER RECOVERED(30m) %d/3  reloads %5d  timeouts %8d",
+				name, util*100, worst.Round(time.Second), never, reloads, timeouts)
 		}
 	}
 }
@@ -698,7 +788,7 @@ func TestTimeoutTippingPoint(t *testing.T) {
 			calm.arrivalPerShard = util * calm.limitPerSec / float64(calm.shards) / 2
 			calm.blipLength = 0
 			if cr := runExecRetryStormSim(t, calm); cr.reloads > 0 || cr.finalOutstanding > float64(4*calm.batchSize*calm.shards) {
-				t.Log(fmt.Sprintf("db %.0f%% util %.0f%%: baseline unstable; skipped", dbFactor*100, util*100))
+				t.Logf("db %.0f%% util %.0f%%: baseline unstable; skipped", dbFactor*100, util*100)
 				continue
 			}
 			for _, blipLen := range []time.Duration{30 * time.Second, 60 * time.Second} {
@@ -715,8 +805,8 @@ func TestTimeoutTippingPoint(t *testing.T) {
 					reloads += r.reloads
 					timeouts += r.timeouts
 				}
-				t.Log(fmt.Sprintf("db %.0f%% util %.0f%% blip %-4v: worst recovery %-8v NEVER RECOVERED(30m) %d/3  reloads %5d  timeouts %8d",
-					dbFactor*100, util*100, blipLen, worst.Round(time.Second), never, reloads, timeouts))
+				t.Logf("db %.0f%% util %.0f%% blip %-4v: worst recovery %-8v NEVER RECOVERED(30m) %d/3  reloads %5d  timeouts %8d",
+					dbFactor*100, util*100, blipLen, worst.Round(time.Second), never, reloads, timeouts)
 			}
 		}
 	}
@@ -735,7 +825,7 @@ func TestTippingPointDetail(t *testing.T) {
 			p.arrivalPerShard = 0.90 * p.limitPerSec / float64(p.shards) / 2
 			p.blipLength, p.seed = 60*time.Second, seed
 			p.shardUpdateMinTasks = minTasks
-			t.Log(fmt.Sprintf("shardUpdateMinTasks=%-4d seed %d: %s", minTasks, seed, formatExecSim(runExecRetryStormSim(t, p))))
+			t.Logf("shardUpdateMinTasks=%-4d seed %d: %s", minTasks, seed, formatExecSim(runExecRetryStormSim(t, p)))
 		}
 	}
 }
@@ -753,7 +843,116 @@ func TestTippingPointLimiterBelowDatabase(t *testing.T) {
 			p.arrivalPerShard = 0.90 * 500 / float64(p.shards) / 2
 			p.limitPerSec, p.burst = limit, limit
 			p.blipLength, p.seed = 60*time.Second, seed
-			t.Log(fmt.Sprintf("limiter %3.0f/s vs database 485/s, seed %d: %s", limit, seed, formatExecSim(runExecRetryStormSim(t, p))))
+			t.Logf("limiter %3.0f/s vs database 485/s, seed %d: %s", limit, seed, formatExecSim(runExecRetryStormSim(t, p)))
 		}
+	}
+}
+
+// TestClientRetryLayerHypothesis tests hypothesis 5: the persistence client has its own retry layer
+// under every queue retry path, with its own transient group (Unavailable and DataLoss, not
+// ResourceExhausted). During a blip each failed call is attempted twice. Does that layer change
+// recovery or the tipping point? Same cases as the earlier hypotheses, layer off vs on. Report-only.
+func TestClientRetryLayerHypothesis(t *testing.T) {
+	type tc struct {
+		name     string
+		dbFactor float64
+		util     float64
+		blip     time.Duration
+	}
+	for _, c := range []tc{
+		{"no DB timeouts, util 95%, 30s blip", 0, 0.95, 30 * time.Second},
+		{"DB 97%, util 90%, 30s blip", 0.97, 0.90, 30 * time.Second},
+		{"DB 97%, util 90%, 60s blip", 0.97, 0.90, 60 * time.Second},
+		{"DB 99%, util 90%, 30s blip", 0.99, 0.90, 30 * time.Second},
+	} {
+		for _, layer := range []bool{false, true} {
+			base := defaultExecSimParams()
+			base.shardReload, base.apiWrites, base.horizon = true, true, 30*time.Minute
+			base.dbCapacity = c.dbFactor * base.limitPerSec
+			base.arrivalPerShard = c.util * base.limitPerSec / float64(base.shards) / 2
+			base.clientRetry = layer
+			calm := base
+			calm.blipLength = 0
+			if cr := runExecRetryStormSim(t, calm); cr.reloads > 0 || cr.finalOutstanding > float64(4*calm.batchSize*calm.shards) {
+				t.Logf("%-36s client retry %-5v: baseline unstable; skipped", c.name, layer)
+				continue
+			}
+			worst, never, reloads, timeouts, retries := time.Duration(0), 0, 0, 0, 0
+			for seed := uint64(1); seed <= 3; seed++ {
+				p := base
+				p.blipLength, p.seed = c.blip, seed
+				r := runExecRetryStormSim(t, p)
+				if r.recoveredAfter < 0 {
+					never++
+				} else {
+					worst = max(worst, r.recoveredAfter)
+				}
+				reloads += r.reloads
+				timeouts += r.timeouts
+				retries += r.clientRetries
+			}
+			t.Logf("%-36s client retry %-5v: worst recovery %-8v NEVER RECOVERED(30m) %d/3  reloads %5d  timeouts %8d  client retries %8d",
+				c.name, layer, worst.Round(time.Second), never, reloads, timeouts, retries)
+		}
+	}
+}
+
+// TestAdaptiveLimiterHypothesis tests hypothesis 6: the server already has a mitigation for the
+// hypothesis 4 loop, the health-based adaptive limiter, off by default. When the share of calls
+// that time out passes an operator-chosen threshold, it lowers the limiter (real defaults: by 0.3
+// per 10s, to no lower than 0.8x), so overflow becomes ResourceExhausted ("not written", no
+// reload) instead of a timeout. Does turning it on prevent the wedge? Two databases: one 3% below
+// the limiter (inside the 0.8x floor) and one 22% below (outside it). Report-only.
+//
+// The signal is measured where the server measures it: the metrics client wraps the rate-limited
+// client, so the limiter's own rejections are recorded calls that count as healthy. During a
+// retry storm they dilute the timeout ratio, so thresholds well below 1% are tried.
+func TestAdaptiveLimiterHypothesis(t *testing.T) {
+	cases := []struct {
+		name           string
+		dbFactor, util float64
+	}{
+		{"DB 97% of limiter, util 90%, 60s blip", 0.97, 0.90},
+		{"DB 78% of limiter, util 70%, 60s blip", 0.78, 0.70},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, threshold := range []float64{0, 0.001, 0.003, 0.01} {
+				base := defaultExecSimParams()
+				base.shardReload, base.apiWrites, base.horizon = true, true, 30*time.Minute
+				base.dbCapacity = c.dbFactor * base.limitPerSec
+				base.arrivalPerShard = c.util * base.limitPerSec / float64(base.shards) / 2
+				base.healthErrorThreshold = threshold
+				base.divergeAt = 200_000
+				label := "off"
+				if threshold > 0 {
+					label = fmt.Sprintf("on, threshold %.3f", threshold)
+				}
+				calm := base
+				calm.blipLength = 0
+				if cr := runExecRetryStormSim(t, calm); cr.reloads > 0 || cr.finalOutstanding > float64(4*calm.batchSize*calm.shards) {
+					t.Logf("%-40s adaptive limiter %-20s: baseline unstable; skipped", c.name, label)
+					continue
+				}
+				worst, never, diverged, reloads, timeouts, minMult := time.Duration(0), 0, 0, 0, 0, 1.0
+				for seed := uint64(1); seed <= 3; seed++ {
+					p := base
+					p.blipLength, p.seed = 60*time.Second, seed
+					r := runExecRetryStormSim(t, p)
+					if r.divergedAt > 0 {
+						diverged++
+					} else if r.recoveredAfter < 0 {
+						never++
+					} else {
+						worst = max(worst, r.recoveredAfter)
+					}
+					reloads += r.reloads
+					timeouts += r.timeouts
+					minMult = min(minMult, r.minMultiplier)
+				}
+				t.Logf("%-40s adaptive limiter %-20s: worst recovery %-8v NEVER RECOVERED(30m) %d/3  DIVERGED(>200k outstanding) %d/3  reloads %5d  timeouts %8d  lowest multiplier %.1f",
+					c.name, label, worst.Round(time.Second), never, diverged, reloads, timeouts, minMult)
+			}
+		})
 	}
 }
