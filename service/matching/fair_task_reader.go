@@ -295,10 +295,8 @@ func (tr *fairTaskReader) readTaskBatch(readLevel fairLevel, loadedTasks int) er
 		// TODO: Should we ever stop retrying on db errors?
 		if tr.backlogMgr.signalIfFatal(err) || common.IsContextCanceledErr(err) {
 			// don't retry
-		} else if common.IsResourceExhausted(err) {
-			tr.retryReadAfter(tr.throttleRetrier.NextBackOff(err))
 		} else {
-			tr.retryReadAfter(tr.retrier.NextBackOff(err))
+			tr.retryReadAfter(tr.readRetryDelay(err))
 		}
 		return err
 	}
@@ -773,4 +771,12 @@ func (tr *fairTaskReader) finalGC() {
 		return
 	}
 	_, _ = tr.doGCAt(ackLevel)
+}
+
+// readRetryDelay picks how long to wait before retrying a failed backlog read.
+func (tr *fairTaskReader) readRetryDelay(err error) time.Duration {
+	if common.IsResourceExhausted(err) {
+		return tr.throttleRetrier.NextBackOff(err)
+	}
+	return tr.retrier.NextBackOff(err)
 }
