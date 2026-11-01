@@ -436,6 +436,8 @@ define lint-go
 		--config=.github/.golangci.yml \
 		$(2)
 	@go vet -tags $(1) -vettool="$(ERRORTYPE)" -style-check=false $(2)
+	@go build -o "$(LOCALBIN)/transienterrorcheck" ./cmd/tools/transienterrorcheck
+	@go vet -tags $(1) -vettool="$(LOCALBIN)/transienterrorcheck" $(2)
 endef
 
 lint-code: $(GOLANGCI_LINT) $(ERRORTYPE)
