@@ -3,6 +3,13 @@
 // error types that the code usually treats alike but some site splits.
 //
 // Usage: errorrules [-json out.json] [-focus T1,T2,...] ./...
+//
+// This tool is its own module so it can use a golang.org/x/tools new enough to read Go 1.27
+// export data; the server's go.mod pins v0.49.0, which cannot ("export data version 5 is
+// greater than maximum supported version 4"). Build it from this directory, run it from the
+// repo root:
+//
+//	go build -o ../../../.bin/errorrules . && cd ../../.. && .bin/errorrules ./...
 package main
 
 import (
@@ -49,12 +56,10 @@ func main() {
 	flag.Parse()
 
 	cfg := &packages.Config{
-		Mode:       packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedDeps | packages.NeedImports,
+		Mode:       packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
 		Tests:      false,
 		BuildFlags: []string{"-tags=disable_grpc_modules"},
 	}
-	// Type-check from source (NeedDeps): golang.org/x/tools cannot read this Go version's export
-	// data, and a package that fails to load must stop the run rather than be skipped.
 	pkgs, err := packages.Load(cfg, flag.Args()...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "load:", err)
