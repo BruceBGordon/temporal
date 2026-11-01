@@ -64,6 +64,7 @@ func (m *SqlStore) txExecute(ctx context.Context, operation string, f func(tx sq
 
 		switch err.(type) {
 		case *persistence.ConditionFailedError,
+			*persistence.AppendHistoryTimeoutError, // safe to retry blindly; must not become Unavailable
 			*persistence.CurrentWorkflowConditionFailedError,
 			*persistence.WorkflowConditionFailedError,
 			*serviceerror.NamespaceAlreadyExists,
