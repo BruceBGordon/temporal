@@ -70,6 +70,11 @@ type execSimParams struct {
 	// workflow write through the shard (one write per task, sharing history.persistenceMaxQPS).
 	// An ambiguous error on such a write makes the shard re-acquire, as in handleWriteErrorLocked.
 	apiWrites bool
+
+	// Hypothesis 4 (ASSUMPTION, not from Temporal code): the database's own capacity, in calls/s, is
+	// slightly below what the host limiters admit (many hosts share one database). Calls the
+	// limiter admits beyond it time out with DeadlineExceeded. 0 disables.
+	dbCapacity float64
 }
 
 func defaultExecSimParams() execSimParams {
@@ -107,6 +112,7 @@ type execSimResult struct {
 	reloads          int // shard re-acquisitions
 	reworkTasks      int // tasks re-read because the saved queue position was behind
 	failedWrites     int // API writes that failed (rejected or ambiguous)
+	timeouts         int // calls admitted by the limiter that the database timed out
 }
 
 type execEvent struct {
@@ -141,6 +147,7 @@ type execSim struct {
 	rng        *rand.Rand
 	limiter    *tokenBucket
 	ackLimiter *tokenBucket
+	db         *tokenBucket
 	busy       int
 	waiting    []Executable
 	shardOf    map[Executable]int
@@ -189,6 +196,9 @@ func (s *execSim) persistenceCall(l *tokenBucket) error {
 			Scope:   enumspb.RESOURCE_EXHAUSTED_SCOPE_SYSTEM,
 			Message: "persistence limit",
 		}
+	case s.db != nil && !s.db.take(s.now):
+		s.res.timeouts++
+		return serviceerror.NewDeadlineExceeded("persistence call timed out")
 	}
 	return nil
 }
@@ -265,7 +275,8 @@ func (s *execSim) stale(e Executable) bool {
 // "definitely not written"; Unavailable falls to the default branch and the shard re-acquires.
 func isAmbiguousWriteError(err error) bool {
 	var u *serviceerror.Unavailable
-	return errors.As(err, &u)
+	var d *serviceerror.DeadlineExceeded
+	return errors.As(err, &u) || errors.As(err, &d)
 }
 
 // startReload models contextRequestLost: the shard re-acquires; its queues restart from the saved
@@ -323,6 +334,12 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 		acquireRetrier:    make([]backoff.Retrier, p.shards),
 	}
 	s.ackLimiter = s.limiter
+	if p.dbCapacity > 0 {
+		// A database queues requests; a call times out only if it would wait longer than its deadline
+		// (queueIOTimeout = 5s), so up to 5 seconds of capacity can be absorbed as a backlog.
+		dbBurst := p.dbCapacity * queueIOTimeout.Seconds()
+		s.db = &tokenBucket{rate: p.dbCapacity, burst: dbBurst, tokens: dbBurst}
+	}
 	if !p.sharedAckLimiter {
 		s.ackLimiter = &tokenBucket{rate: p.limitPerSec, burst: p.burst, tokens: p.burst}
 	}
@@ -616,6 +633,127 @@ func TestShardReloadHypothesis(t *testing.T) {
 					t.Errorf("[%s] the reload mechanism never fired; this result says nothing about hypothesis 1", c.name)
 				}
 			}
+		}
+	}
+}
+
+// TestTimeoutHypothesis tests hypothesis 4 (an ASSUMPTION about the database, labeled as such):
+// if the database itself is slightly smaller than what the host limiters admit, timeouts are
+// ambiguous writes, so shards reload and redo work, which adds load and more timeouts.
+//
+// Metastability is tested by its definition: at each load level the system must first be stable
+// without a blip; only then is it hit with a 5s blip, and we ask whether it comes back. Load levels
+// whose baseline is already unstable are reported and skipped. Report-only.
+func TestTimeoutHypothesis(t *testing.T) {
+	for _, dbFactor := range []float64{0, 0.99, 0.97} {
+		name := fmt.Sprintf("db capacity %.0f%% of limiter", dbFactor*100)
+		if dbFactor == 0 {
+			name = "no database timeouts"
+		}
+		base := func(util float64) execSimParams {
+			p := defaultExecSimParams()
+			p.shardReload, p.apiWrites, p.horizon = true, true, 30*time.Minute
+			p.dbCapacity = dbFactor * p.limitPerSec
+			p.arrivalPerShard = util * p.limitPerSec / float64(p.shards) / 2
+			return p
+		}
+		for _, util := range []float64{0.80, 0.85, 0.90, 0.95} {
+			calm := base(util)
+			calm.blipLength = 0
+			cr := runExecRetryStormSim(t, calm)
+			if cr.finalOutstanding > float64(4*calm.batchSize*calm.shards) || cr.reloads > 0 {
+				t.Log(fmt.Sprintf("[%s] util %.0f%%: baseline UNSTABLE without a blip (reloads %d, final outstanding %.0f); skipped",
+					name, util*100, cr.reloads, cr.finalOutstanding))
+				continue
+			}
+			worst, never, reloads, timeouts := time.Duration(0), 0, 0, 0
+			for seed := uint64(1); seed <= 3; seed++ {
+				p := base(util)
+				p.seed = seed
+				r := runExecRetryStormSim(t, p)
+				if r.recoveredAfter < 0 {
+					never++
+				} else {
+					worst = max(worst, r.recoveredAfter)
+				}
+				reloads += r.reloads
+				timeouts += r.timeouts
+			}
+			t.Log(fmt.Sprintf("[%s] util %.0f%%: baseline stable; after 5s blip worst recovery %-8v NEVER RECOVERED(30m) %d/3  reloads %5d  timeouts %8d",
+				name, util*100, worst.Round(time.Second), never, reloads, timeouts))
+		}
+	}
+}
+
+// TestTimeoutTippingPoint asks the metastability question directly: a system that is stable
+// without a blip is hit with blips of increasing length. Does a large enough trigger push it into
+// the timeout -> reload -> redo loop, so that it does not come back after the blip ends?
+// Uses the hypothesis 4 database ASSUMPTION. Report-only.
+func TestTimeoutTippingPoint(t *testing.T) {
+	for _, dbFactor := range []float64{0.99, 0.97} {
+		for _, util := range []float64{0.85, 0.90} {
+			calm := defaultExecSimParams()
+			calm.shardReload, calm.apiWrites, calm.horizon = true, true, 30*time.Minute
+			calm.dbCapacity = dbFactor * calm.limitPerSec
+			calm.arrivalPerShard = util * calm.limitPerSec / float64(calm.shards) / 2
+			calm.blipLength = 0
+			if cr := runExecRetryStormSim(t, calm); cr.reloads > 0 || cr.finalOutstanding > float64(4*calm.batchSize*calm.shards) {
+				t.Log(fmt.Sprintf("db %.0f%% util %.0f%%: baseline unstable; skipped", dbFactor*100, util*100))
+				continue
+			}
+			for _, blipLen := range []time.Duration{30 * time.Second, 60 * time.Second} {
+				worst, never, reloads, timeouts := time.Duration(0), 0, 0, 0
+				for seed := uint64(1); seed <= 3; seed++ {
+					p := calm
+					p.blipLength, p.seed = blipLen, seed
+					r := runExecRetryStormSim(t, p)
+					if r.recoveredAfter < 0 {
+						never++
+					} else {
+						worst = max(worst, r.recoveredAfter)
+					}
+					reloads += r.reloads
+					timeouts += r.timeouts
+				}
+				t.Log(fmt.Sprintf("db %.0f%% util %.0f%% blip %-4v: worst recovery %-8v NEVER RECOVERED(30m) %d/3  reloads %5d  timeouts %8d",
+					dbFactor*100, util*100, blipLen, worst.Round(time.Second), never, reloads, timeouts))
+			}
+		}
+	}
+}
+
+// TestTippingPointDetail runs the tipping case (database ASSUMPTION at 97% of the limiter, 90%
+// load, 60s blip) for a simulated hour, with the real setting history.shardUpdateMinTasksCompleted
+// = 1000 and with a candidate mitigation of 100 (persist the queue position more often, so a reload
+// redoes less work). Report-only.
+func TestTippingPointDetail(t *testing.T) {
+	for _, minTasks := range []int{1000, 100} {
+		for seed := uint64(1); seed <= 3; seed++ {
+			p := defaultExecSimParams()
+			p.shardReload, p.apiWrites, p.horizon = true, true, time.Hour
+			p.dbCapacity = 0.97 * p.limitPerSec
+			p.arrivalPerShard = 0.90 * p.limitPerSec / float64(p.shards) / 2
+			p.blipLength, p.seed = 60*time.Second, seed
+			p.shardUpdateMinTasks = minTasks
+			t.Log(fmt.Sprintf("shardUpdateMinTasks=%-4d seed %d: %s", minTasks, seed, formatExecSim(runExecRetryStormSim(t, p))))
+		}
+	}
+}
+
+// TestTippingPointLimiterBelowDatabase tests the classic mitigation for the tipping case: keep what
+// the limiter admits below what the database can serve, so the redo burst queues at the limiter
+// (ResourceExhausted: "not written", no reload) instead of timing out at the database (ambiguous,
+// reload). Same absolute load and the same 60s blip as TestTippingPointDetail. Report-only.
+func TestTippingPointLimiterBelowDatabase(t *testing.T) {
+	for _, limit := range []float64{500, 470} {
+		for seed := uint64(1); seed <= 3; seed++ {
+			p := defaultExecSimParams()
+			p.shardReload, p.apiWrites, p.horizon = true, true, 30*time.Minute
+			p.dbCapacity = 0.97 * 500 // the database: 485 calls/s, as in the tipping case
+			p.arrivalPerShard = 0.90 * 500 / float64(p.shards) / 2
+			p.limitPerSec, p.burst = limit, limit
+			p.blipLength, p.seed = 60*time.Second, seed
+			t.Log(fmt.Sprintf("limiter %3.0f/s vs database 485/s, seed %d: %s", limit, seed, formatExecSim(runExecRetryStormSim(t, p))))
 		}
 	}
 }
