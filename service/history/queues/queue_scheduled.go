@@ -294,9 +294,11 @@ func IsTimeExpired(
 }
 
 // lookAheadRetryTime picks when to retry loading the look-ahead task after a failure.
+// Like readerRetryDelay, the whole transient-persistence group gets the jittered rate-limit
+// delay, not just ResourceExhausted (issue #11547).
 func lookAheadRetryTime(err error, now time.Time, lookAheadMinTime time.Time) time.Time {
-	if common.IsResourceExhausted(err) {
-		return now.Add(lookAheadRateLimitDelay)
+	if common.IsPersistenceTransientError(err) {
+		return now.Add(backoff.Jitter(lookAheadRateLimitDelay, throttleRetryJitterCoefficient))
 	}
 	// NOTE: the backoff is actually TimerProcessorMaxTimeShift = ~1s
 	// since lookAheadMinTime ~= now + TimerProcessorMaxTimeShift when

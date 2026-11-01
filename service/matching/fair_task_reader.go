@@ -36,7 +36,9 @@ type (
 		backoffTimer    *time.Timer
 		retrier         backoff.Retrier
 		throttleRetrier backoff.Retrier
-		addRetries      *semaphore.Weighted
+		// throttled is set by a ResourceExhausted read error and cleared by a successful read.
+		throttled  bool
+		addRetries *semaphore.Weighted
 
 		backlogAge       backlogAgeTracker
 		outstandingTasks *btree.BTreeG[outstandingTask] // level-ordered outstanding tasks and acks
@@ -302,6 +304,7 @@ func (tr *fairTaskReader) readTaskBatch(readLevel fairLevel, loadedTasks int) er
 	}
 	tr.retrier.Reset()
 	tr.throttleRetrier.Reset()
+	tr.throttled = false
 
 	// If we got less than we asked for, we know we hit the end.
 	// If there was a concurrent write such that we incorrectly think we hit the end here,
@@ -774,8 +777,16 @@ func (tr *fairTaskReader) finalGC() {
 }
 
 // readRetryDelay picks how long to wait before retrying a failed backlog read.
+//
+// While the reader is throttled for ResourceExhausted, an Unavailable blip (same
+// transient-persistence group, common.IsPersistenceTransientError) keeps the throttle
+// backoff instead of switching to the fast retrier (same failure shape as issue #11547).
+// Without overload, a blip keeps the fast retrier so ordinary recovery stays quick.
 func (tr *fairTaskReader) readRetryDelay(err error) time.Duration {
 	if common.IsResourceExhausted(err) {
+		tr.throttled = true
+	}
+	if tr.throttled && common.IsPersistenceTransientError(err) {
 		return tr.throttleRetrier.NextBackOff(err)
 	}
 	return tr.retrier.NextBackOff(err)
