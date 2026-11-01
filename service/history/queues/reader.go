@@ -455,11 +455,7 @@ func (r *ReaderImpl) loadAndSubmitTasks() {
 	tasks, err := loadSlice.SelectTasks(r.readerID, r.options.BatchSize())
 	if err != nil {
 		r.logger.Error("Queue reader unable to retrieve tasks", tag.Error(err))
-		if common.IsResourceExhausted(err) {
-			r.pauseLocked(throttleRetryDelay)
-		} else {
-			r.pauseLocked(r.retrier.NextBackOff(err))
-		}
+		r.pauseLocked(readerRetryDelay(err, r.retrier))
 		return
 	}
 	r.retrier.Reset()
@@ -577,4 +573,12 @@ func validateSlicesOrderedDisjoint(
 			))
 		}
 	}
+}
+
+// readerRetryDelay picks how long the reader pauses after it fails to load tasks.
+func readerRetryDelay(err error, retrier backoff.Retrier) time.Duration {
+	if common.IsResourceExhausted(err) {
+		return throttleRetryDelay
+	}
+	return retrier.NextBackOff(err)
 }

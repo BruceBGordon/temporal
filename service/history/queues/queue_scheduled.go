@@ -254,14 +254,7 @@ func (p *scheduledQueue) lookAheadTask() {
 	response, err := p.shard.GetHistoryTasks(ctx, request)
 	if err != nil {
 		p.logger.Error("Failed to load look ahead task", tag.Error(err))
-		if common.IsResourceExhausted(err) {
-			p.timerGate.Update(p.timeSource.Now().Add(lookAheadRateLimitDelay))
-		} else {
-			// NOTE: the backoff is actually TimerProcessorMaxTimeShift = ~1s
-			// since lookAheadMinTime ~= now + TimerProcessorMaxTimeShift when
-			// shard is valid.
-			p.timerGate.Update(lookAheadMinTime)
-		}
+		p.timerGate.Update(lookAheadRetryTime(err, p.timeSource.Now(), lookAheadMinTime))
 		return
 	}
 
@@ -298,4 +291,15 @@ func IsTimeExpired(
 	referenceTime = util.MaxTime(referenceTime, task.GetKey().FireTime).Truncate(common.ScheduledTaskMinPrecision)
 	testingTime = testingTime.Truncate(common.ScheduledTaskMinPrecision)
 	return !testingTime.After(referenceTime)
+}
+
+// lookAheadRetryTime picks when to retry loading the look-ahead task after a failure.
+func lookAheadRetryTime(err error, now time.Time, lookAheadMinTime time.Time) time.Time {
+	if common.IsResourceExhausted(err) {
+		return now.Add(lookAheadRateLimitDelay)
+	}
+	// NOTE: the backoff is actually TimerProcessorMaxTimeShift = ~1s
+	// since lookAheadMinTime ~= now + TimerProcessorMaxTimeShift when
+	// shard is valid.
+	return lookAheadMinTime
 }
