@@ -83,6 +83,7 @@ func (eh *RequestErrorHandler) logError(
 ) {
 	logAllErrors := nsName != "" && eh.logAllReqErrors(nsName.String())
 	// context errors may not be user errors, but still too noisy to log by default
+	//transienterror:ignore decides what to log, not how to retry
 	if !logAllErrors && (isExpectedError ||
 		common.IsContextDeadlineExceededErr(err) ||
 		common.IsContextCanceledErr(err) ||

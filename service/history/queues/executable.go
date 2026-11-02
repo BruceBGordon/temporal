@@ -531,7 +531,13 @@ func (e *executableImpl) isExpectedRetryableError(err error) (isRetryable bool, 
 			1, metrics.ResourceExhaustedCauseTag(resourceExhaustedErr.Cause))
 		return true, err
 	}
-	e.resourceExhaustedCount = 0
+	if !common.IsPersistenceTransientError(err) {
+		// An Unavailable blip belongs to the same transient-persistence group as
+		// ResourceExhausted. It must not erase the overload backoff built up so far,
+		// or the task retries at full speed into a persistence layer that is still
+		// recovering (issue #11547).
+		e.resourceExhaustedCount = 0
+	}
 
 	if _, ok := err.(*serviceerror.NamespaceNotActive); ok {
 		// error is expected when there's namespace failover,
@@ -866,7 +872,7 @@ func (e *executableImpl) shouldResubmitOnNack(err error) bool {
 	}
 
 	if !errors.Is(err, consts.ErrResourceExhaustedBusyWorkflow) &&
-		common.IsResourceExhausted(err) &&
+		e.isOverloadSignal(err) &&
 		e.resourceExhaustedCount > resourceExhaustedResubmitMaxAttempts {
 		return false
 	}
@@ -903,7 +909,7 @@ func (e *executableImpl) backoffDuration(
 	}
 
 	backoffDuration := reschedulePolicy.ComputeNextDelay(0, int(e.attempt.Load()), err)
-	if !errors.Is(err, consts.ErrResourceExhaustedBusyWorkflow) && common.IsResourceExhausted(err) {
+	if !errors.Is(err, consts.ErrResourceExhaustedBusyWorkflow) && e.isOverloadSignal(err) {
 		// try a different reschedule policy to slow down retry
 		// upon system resource exhausted error and pick the longer backoff duration
 		backoffDuration = max(
@@ -913,6 +919,18 @@ func (e *executableImpl) backoffDuration(
 	}
 
 	return backoffDuration
+}
+
+// isOverloadSignal reports whether err should be handled with the overload backoff.
+// ResourceExhausted always is. Unavailable, from the same transient-persistence group
+// (common.IsPersistenceTransientError), is when it arrives while the task is already backing
+// off for ResourceExhausted, so a brief blip cannot bypass the overload protection
+// (issue #11547). Without overload history, Unavailable keeps the normal fast path.
+func (e *executableImpl) isOverloadSignal(err error) bool {
+	if common.IsResourceExhausted(err) {
+		return true
+	}
+	return common.IsPersistenceTransientError(err) && e.resourceExhaustedCount > 0
 }
 
 func (e *executableImpl) incAttempt() {
