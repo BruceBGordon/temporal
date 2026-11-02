@@ -14,6 +14,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -21,10 +22,12 @@ import (
 	"go/printer"
 	"go/token"
 	"go/types"
+	"maps"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 
+	"go.temporal.io/server/cmd/tools/errorrules/internal/scan"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -54,29 +57,47 @@ func main() {
 	minTogether := flag.Int("min", 3, "minimum sites where two types are treated alike before a split is reported")
 	pairs := flag.Bool("pairs", false, "also report every implicit pair split (noisy)")
 	flag.Parse()
-
-	cfg := &packages.Config{
-		Mode:       packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
-		Tests:      false,
-		BuildFlags: []string{"-tags=disable_grpc_modules"},
+	if err := run(flag.Args(), *jsonOut, *focus, *minTogether, *pairs); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2) // the scan itself is broken
 	}
-	pkgs, err := packages.Load(cfg, flag.Args()...)
+}
+
+// run scans the packages matching patterns and prints the analyses.
+func run(patterns []string, jsonOut, focus string, minTogether int, pairs bool) error {
+	pkgs, err := scan.Load(patterns)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "load:", err)
-		os.Exit(2)
+		return err
 	}
-	// No silent fallbacks: any package that fails to load fails the run.
-	loadErrs := 0
-	packages.Visit(pkgs, nil, func(p *packages.Package) {
-		for _, e := range p.Errors {
-			loadErrs++
-			fmt.Fprintln(os.Stderr, "package error:", e)
-		}
-	})
-	if loadErrs > 0 {
-		os.Exit(2)
+	files, sites := collectSites(pkgs)
+	// Anti-vacuity: the tool must have looked at the code it claims to cover.
+	if err := scan.RequireScanned(files); err != nil {
+		return err
 	}
+	if len(sites) < 20 {
+		return fmt.Errorf("suspiciously little scanned: %d files, %d sites", files, len(sites))
+	}
+	fmt.Printf("scanned %d files, found %d error-classification sites\n\n", files, len(sites))
 
+	if jsonOut != "" {
+		if err := writeJSON(jsonOut, sites); err != nil {
+			return err
+		}
+	}
+	if focus != "" {
+		tabulate(sites, strings.Split(focus, ","))
+	}
+	preds := predicatesOf(sites)
+	sameName(preds)
+	restatements(sites, preds)
+	if pairs {
+		splits(sites, minTogether)
+	}
+	return nil
+}
+
+// collectSites finds every type switch over an error value in the server's production files.
+func collectSites(pkgs []*packages.Package) (int, []*Site) {
 	errorType := types.Universe.Lookup("error").Type()
 	var sites []*Site
 	files := 0
@@ -85,48 +106,42 @@ func main() {
 			continue
 		}
 		for _, f := range p.Syntax {
-			fname := p.Fset.Position(f.Pos()).Filename
-			if strings.HasSuffix(fname, "_test.go") || strings.Contains(fname, "/testing/") || strings.Contains(fname, "/tests/") {
+			if scan.IsTestFile(p.Fset.Position(f.Pos()).Filename) {
 				continue
 			}
 			files++
-			var curFunc string
-			ast.Inspect(f, func(n ast.Node) bool {
-				switch n := n.(type) {
-				case *ast.FuncDecl:
-					curFunc = funcName(n)
-				case *ast.TypeSwitchStmt:
-					if s := extract(p, n, errorType, curFunc); s != nil {
-						sites = append(sites, s)
-					}
-				}
-				return true
-			})
+			sites = append(sites, fileSites(p, f, errorType)...)
 		}
 	}
-	// Anti-vacuity: the tool must have looked at the code it claims to cover.
-	if files < 1000 || len(sites) < 20 {
-		fmt.Fprintf(os.Stderr, "suspiciously little scanned: %d files, %d sites\n", files, len(sites))
-		os.Exit(2)
-	}
-	fmt.Printf("scanned %d files, found %d error-classification sites\n\n", files, len(sites))
+	return files, sites
+}
 
-	if *jsonOut != "" {
-		b, _ := json.MarshalIndent(sites, "", "  ")
-		if err := os.WriteFile(*jsonOut, b, 0o644); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
+// fileSites returns the file's type switches over an error value, each tagged with its function.
+func fileSites(p *packages.Package, f *ast.File, errorType types.Type) []*Site {
+	var sites []*Site
+	var curFunc string
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.FuncDecl:
+			curFunc = funcName(n)
+		case *ast.TypeSwitchStmt:
+			if s := extract(p, n, errorType, curFunc); s != nil {
+				sites = append(sites, s)
+			}
+		default:
+			// only functions and type switches matter here
 		}
+		return true
+	})
+	return sites
+}
+
+func writeJSON(path string, sites []*Site) error {
+	b, err := json.MarshalIndent(sites, "", "  ")
+	if err != nil {
+		return err
 	}
-	if *focus != "" {
-		tabulate(sites, strings.Split(*focus, ","))
-	}
-	preds := predicatesOf(sites)
-	sameName(preds)
-	restatements(sites, preds)
-	if *pairs {
-		splits(sites, *minTogether)
-	}
+	return os.WriteFile(path, b, 0o644)
 }
 
 // predicate is a declared classifier: a function whose type switch answers true or false.
@@ -158,10 +173,12 @@ func predicatesOf(sites []*Site) []predicate {
 			p.deflt = "true"
 		case "return false;":
 			p.deflt = "false"
+		default:
+			p.deflt = "" // no default clause, or one that does more than answer
 		}
 		if ok && len(p.yes)+len(p.no) > 0 {
-			sort.Strings(p.yes)
-			sort.Strings(p.no)
+			slices.Sort(p.yes)
+			slices.Sort(p.no)
 			ps = append(ps, p)
 		}
 	}
@@ -186,7 +203,7 @@ func sameName(ps []predicate) {
 	for n := range byName {
 		names = append(names, n)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	found := 0
 	for _, n := range names {
 		g := byName[n]
@@ -279,26 +296,26 @@ func funcName(fd *ast.FuncDecl) string {
 }
 
 func extract(p *packages.Package, ts *ast.TypeSwitchStmt, errorType types.Type, fn string) *Site {
-	var x ast.Expr
-	switch a := ts.Assign.(type) {
-	case *ast.AssignStmt:
-		x = a.Rhs[0].(*ast.TypeAssertExpr).X
-	case *ast.ExprStmt:
-		x = a.X.(*ast.TypeAssertExpr).X
+	x, ok := switchedValue(ts)
+	if !ok {
+		return nil
 	}
 	tv, ok := p.TypesInfo.Types[x]
 	if !ok || !types.Identical(tv.Type, errorType) {
 		return nil
 	}
 	s := &Site{
-		Pos:      shortPos(p.Fset.Position(ts.Pos())),
+		Pos:      scan.Pos(p.Fset.Position(ts.Pos())),
 		Func:     fn,
 		Outcomes: map[string][]string{},
 		Bodies:   map[string]string{},
 	}
 	bodyIDs := map[string]string{} // normalized body -> outcome id
 	for _, c := range ts.Body.List {
-		cc := c.(*ast.CaseClause)
+		cc, ok := c.(*ast.CaseClause)
+		if !ok {
+			continue // go/ast: a type switch body holds only case clauses
+		}
 		body := normalize(cc.Body)
 		id, ok := bodyIDs[body]
 		if !ok {
@@ -324,6 +341,25 @@ func extract(p *packages.Package, ts *ast.TypeSwitchStmt, errorType types.Type, 
 	return s
 }
 
+// switchedValue returns the value a type switch is over: x in "switch v := x.(type)" or
+// "switch x.(type)".
+func switchedValue(ts *ast.TypeSwitchStmt) (ast.Expr, bool) {
+	var e ast.Expr
+	switch a := ts.Assign.(type) {
+	case *ast.AssignStmt:
+		e = a.Rhs[0]
+	case *ast.ExprStmt:
+		e = a.X
+	default:
+		return nil, false
+	}
+	ta, ok := e.(*ast.TypeAssertExpr)
+	if !ok {
+		return nil, false
+	}
+	return ta.X, true
+}
+
 // normalize prints a clause body without comments so that clauses that do
 // the same thing compare equal.
 func normalize(stmts []ast.Stmt) string {
@@ -341,14 +377,6 @@ func typeName(t types.Type) string {
 	}
 	s := types.TypeString(t, func(p *types.Package) string { return p.Name() })
 	return strings.TrimPrefix(s, "*")
-}
-
-func shortPos(p token.Position) string {
-	f := p.Filename
-	if i := strings.Index(f, "/temporal/"); i >= 0 {
-		f = f[i+len("/temporal/"):]
-	}
-	return fmt.Sprintf("%s:%d", f, p.Line)
 }
 
 func tabulate(sites []*Site, focus []string) {
@@ -396,19 +424,43 @@ func trunc(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
+// pair is two error types, a < b.
+type pair struct{ a, b string }
+
 // splits finds implicit groups: pairs of error types that several sites treat
 // identically (listed together, same outcome), and reports the sites that
 // treat the pair differently.
 func splits(sites []*Site, minTogether int) {
-	type pair struct{ a, b string }
+	together := pairsTreatedAlike(sites)
+	apart := sitesSplitting(sites, together, minTogether)
+	prs := slices.Collect(maps.Keys(apart))
+	slices.SortFunc(prs, func(x, y pair) int {
+		if c := cmp.Compare(len(together[y]), len(together[x])); c != 0 {
+			return c // most sites alike first
+		}
+		return strings.Compare(x.a+x.b, y.a+y.b)
+	})
+	fmt.Printf("== Implicit groups that some site splits (treated alike at >= %d sites) ==\n", minTogether)
+	for _, pr := range prs {
+		fmt.Printf("\n%s + %s: alike at %d sites, split at %d:\n", pr.a, pr.b, len(together[pr]), len(apart[pr]))
+		for _, s := range apart[pr] {
+			oa, ea := s.outcomeOf(pr.a)
+			ob, eb := s.outcomeOf(pr.b)
+			fmt.Printf("    %s %s: %s->%s%s, %s->%s%s\n", s.Pos, s.Func, short(pr.a), oa, dflt(ea), short(pr.b), ob, dflt(eb))
+		}
+	}
+}
+
+// pairsTreatedAlike maps each pair of explicitly listed types to the sites that give both the
+// same outcome.
+func pairsTreatedAlike(sites []*Site) map[pair][]*Site {
 	together := map[pair][]*Site{}
-	apart := map[pair][]*Site{}
 	for _, s := range sites {
 		var listed []string
 		for _, ts := range s.Outcomes {
 			listed = append(listed, ts...)
 		}
-		sort.Strings(listed)
+		slices.Sort(listed)
 		for i := range listed {
 			for j := i + 1; j < len(listed); j++ {
 				a, b := listed[i], listed[j]
@@ -423,8 +475,14 @@ func splits(sites []*Site, minTogether int) {
 			}
 		}
 	}
-	// A split: a site that mentions one member explicitly and gives the
-	// other a different outcome (explicitly or through default).
+	return together
+}
+
+// sitesSplitting maps each pair treated alike at minTogether or more sites to the sites that
+// mention one member explicitly and give the other a different outcome (explicitly or through
+// default).
+func sitesSplitting(sites []*Site, together map[pair][]*Site, minTogether int) map[pair][]*Site {
+	apart := map[pair][]*Site{}
 	for pr, ts := range together {
 		if len(ts) < minTogether {
 			continue
@@ -432,33 +490,12 @@ func splits(sites []*Site, minTogether int) {
 		for _, s := range sites {
 			oa, ea := s.outcomeOf(pr.a)
 			ob, eb := s.outcomeOf(pr.b)
-			if !ea && !eb {
-				continue
-			}
-			if oa != ob {
+			if (ea || eb) && oa != ob {
 				apart[pr] = append(apart[pr], s)
 			}
 		}
 	}
-	var prs []pair
-	for pr := range apart {
-		prs = append(prs, pr)
-	}
-	sort.Slice(prs, func(i, j int) bool {
-		if len(together[prs[i]]) != len(together[prs[j]]) {
-			return len(together[prs[i]]) > len(together[prs[j]])
-		}
-		return prs[i].a+prs[i].b < prs[j].a+prs[j].b
-	})
-	fmt.Printf("== Implicit groups that some site splits (treated alike at >= %d sites) ==\n", minTogether)
-	for _, pr := range prs {
-		fmt.Printf("\n%s + %s: alike at %d sites, split at %d:\n", pr.a, pr.b, len(together[pr]), len(apart[pr]))
-		for _, s := range apart[pr] {
-			oa, ea := s.outcomeOf(pr.a)
-			ob, eb := s.outcomeOf(pr.b)
-			fmt.Printf("    %s %s: %s->%s%s, %s->%s%s\n", s.Pos, s.Func, short(pr.a), oa, dflt(ea), short(pr.b), ob, dflt(eb))
-		}
-	}
+	return apart
 }
 
 func short(t string) string { return t[strings.LastIndex(t, ".")+1:] }

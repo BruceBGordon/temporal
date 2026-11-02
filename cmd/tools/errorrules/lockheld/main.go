@@ -11,9 +11,10 @@ import (
 	"go/token"
 	"go/types"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 
+	"go.temporal.io/server/cmd/tools/errorrules/internal/scan"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -55,25 +56,22 @@ type finding struct {
 	calls         []string
 }
 
+// knownHolders are the shard's io-semaphore holders behind #12246. The scan must find them, or it
+// is checking nothing.
+var knownHolders = []string{"(*ContextImpl).AssertOwnership", "(*ContextImpl).UpdateWorkflowExecution", "(*ContextImpl).updateShardInfo"}
+
 func main() {
-	cfg := &packages.Config{
-		Mode:       packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
-		BuildFlags: []string{"-tags=disable_grpc_modules"},
-	}
-	pkgs, err := packages.Load(cfg, os.Args[1:]...)
-	if err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
+		os.Exit(2) // the scan itself is broken
 	}
-	bad := 0
-	packages.Visit(pkgs, nil, func(p *packages.Package) {
-		for _, e := range p.Errors {
-			bad++
-			fmt.Fprintln(os.Stderr, "package error:", e)
-		}
-	})
-	if bad > 0 {
-		os.Exit(2)
+}
+
+// run scans the packages matching patterns and prints what it finds.
+func run(patterns []string) error {
+	pkgs, err := scan.Load(patterns)
+	if err != nil {
+		return err
 	}
 	var out []finding
 	files := 0
@@ -81,110 +79,141 @@ func main() {
 		if !strings.HasPrefix(p.PkgPath, "go.temporal.io/server") || strings.HasPrefix(p.PkgPath, persistencePrefix) {
 			continue // the persistence layer itself is the callee, not a holder
 		}
-		for _, f := range p.Syntax {
-			name := p.Fset.Position(f.Pos()).Filename
-			if strings.HasSuffix(name, "_test.go") || strings.Contains(name, "/tests/") || strings.Contains(name, "/testing/") {
-				continue
-			}
-			files++
-			for _, d := range f.Decls {
-				fd, ok := d.(*ast.FuncDecl)
-				if !ok || fd.Body == nil {
-					continue
-				}
-				out = append(out, scan(p, fd)...)
-			}
-		}
+		n, found := scanPackage(p)
+		files += n
+		out = append(out, found...)
 	}
-	if files < 1000 {
-		fmt.Fprintf(os.Stderr, "suspiciously little scanned: %d files\n", files)
-		os.Exit(2)
+	if err := scan.RequireScanned(files); err != nil {
+		return err
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].pos < out[j].pos })
-	// Anti-vacuity: the scan must find the holders behind #12246, or it is checking nothing.
-	for _, want := range []string{"(*ContextImpl).AssertOwnership", "(*ContextImpl).UpdateWorkflowExecution", "(*ContextImpl).updateShardInfo"} {
-		found := false
-		for _, f := range out {
-			found = found || f.fn == want
-		}
-		if !found {
-			fmt.Fprintf(os.Stderr, "known holder %s not found: the scan is broken\n", want)
-			os.Exit(2)
-		}
+	slices.SortFunc(out, func(a, b finding) int { return strings.Compare(a.pos, b.pos) })
+	if err := requireKnownHolders(out); err != nil {
+		return err
 	}
 	fmt.Printf("scanned %d files; %d functions hold a lock across a persistence call\n\n", files, len(out))
 	for _, f := range out {
 		fmt.Printf("%s %s\n    holds %s across: %s\n", f.pos, f.fn, f.lock, strings.Join(f.calls, ", "))
 	}
+	return nil
 }
 
-// scan finds, in source order, a lock acquisition followed later in the same function by calls
-// whose method belongs to a type declared in the persistence packages.
-func scan(p *packages.Package, fd *ast.FuncDecl) []finding {
-	type acq struct {
-		pos              token.Pos
-		expr, recv, name string
-	}
-	var acqs []acq
-	ast.Inspect(fd.Body, func(n ast.Node) bool {
-		if _, ok := n.(*ast.FuncLit); ok {
-			return false
+// scanPackage scans the package's production files and returns how many it scanned and the
+// holds it found.
+func scanPackage(p *packages.Package) (int, []finding) {
+	files := 0
+	var out []finding
+	for _, f := range p.Syntax {
+		if scan.IsTestFile(p.Fset.Position(f.Pos()).Filename) {
+			continue
 		}
-		if c, ok := n.(*ast.CallExpr); ok {
-			if sel, ok := c.Fun.(*ast.SelectorExpr); ok && acquireNames[sel.Sel.Name] {
-				if _, isDefer := parentDefer(fd.Body, c); !isDefer {
-					acqs = append(acqs, acq{c.Pos(), exprString(sel), exprString(sel.X), sel.Sel.Name})
-				}
+		files++
+		for _, d := range f.Decls {
+			if fd, ok := d.(*ast.FuncDecl); ok && fd.Body != nil {
+				out = append(out, scanFunc(p, fd)...)
 			}
 		}
-		return true
-	})
+	}
+	return files, out
+}
+
+// requireKnownHolders is the anti-vacuity check: every known holder must be among the findings.
+func requireKnownHolders(out []finding) error {
+	for _, want := range knownHolders {
+		if !slices.ContainsFunc(out, func(f finding) bool { return f.fn == want }) {
+			return fmt.Errorf("known holder %s not found: the scan is broken", want)
+		}
+	}
+	return nil
+}
+
+// acquisition is one call that takes a lock or semaphore.
+type acquisition struct {
+	pos              token.Pos
+	expr, recv, name string
+}
+
+// scanFunc finds, in source order, a lock acquisition followed later in the same function by
+// calls whose method belongs to a type declared in the persistence packages.
+func scanFunc(p *packages.Package, fd *ast.FuncDecl) []finding {
 	fn := fd.Name.Name
 	if fd.Recv != nil && len(fd.Recv.List) > 0 {
 		fn = "(" + exprString(fd.Recv.List[0].Type) + ")." + fn
 	}
 	var out []finding
-	for _, a := range acqs {
+	for _, a := range acquisitions(fd) {
 		releasePos := releaseOf(fd.Body, a.pos, a.recv, releaseFor[a.name])
-		seen := map[string]bool{}
-		var calls []string
-		ast.Inspect(fd.Body, func(n ast.Node) bool {
-			if _, ok := n.(*ast.FuncLit); ok {
-				return false
-			}
-			c, ok := n.(*ast.CallExpr)
-			if !ok || c.Pos() < a.pos || c.Pos() > releasePos {
-				return true
-			}
-			sel, ok := c.Fun.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			obj, ok := p.TypesInfo.Uses[sel.Sel].(*types.Func)
-			if !ok || obj.Pkg() == nil || !strings.HasPrefix(obj.Pkg().Path(), persistencePrefix) {
-				return true
-			}
-			sig, _ := obj.Type().(*types.Signature)
-			if sig == nil || sig.Recv() == nil || !ioReceiver(sig.Recv().Type()) {
-				return true // a helper or serializer, not a call into a store, manager or queue
-			}
-			if k := obj.Name(); !seen[k] {
-				seen[k] = true
-				calls = append(calls, k)
-			}
-			return true
-		})
+		calls := persistenceCallsBetween(p, fd.Body, a.pos, releasePos)
 		if len(calls) == 0 {
 			continue
 		}
-		pos := p.Fset.Position(a.pos)
-		file := pos.Filename
-		if i := strings.Index(file, "/temporal/"); i >= 0 {
-			file = file[i+len("/temporal/"):]
-		}
-		out = append(out, finding{pos: fmt.Sprintf("%s:%d", file, pos.Line), fn: fn, lock: a.expr, calls: calls})
+		pos := scan.Pos(p.Fset.Position(a.pos))
+		out = append(out, finding{pos: pos, fn: fn, lock: a.expr, calls: calls})
 	}
 	return out
+}
+
+// acquisitions lists the function's own, non-deferred lock and semaphore acquisitions; function
+// literals inside it are not its own code path.
+func acquisitions(fd *ast.FuncDecl) []acquisition {
+	var acqs []acquisition
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		c, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := c.Fun.(*ast.SelectorExpr)
+		if !ok || !acquireNames[sel.Sel.Name] {
+			return true
+		}
+		if _, isDefer := parentDefer(fd.Body, c); !isDefer {
+			acqs = append(acqs, acquisition{c.Pos(), exprString(sel), exprString(sel.X), sel.Sel.Name})
+		}
+		return true
+	})
+	return acqs
+}
+
+// persistenceCallsBetween lists, once each and in source order, the persistence I/O methods
+// called in body between from and to.
+func persistenceCallsBetween(p *packages.Package, body *ast.BlockStmt, from, to token.Pos) []string {
+	seen := map[string]bool{}
+	var calls []string
+	ast.Inspect(body, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		c, ok := n.(*ast.CallExpr)
+		if !ok || c.Pos() < from || c.Pos() > to {
+			return true
+		}
+		if k, ok := persistenceIOMethod(p, c); ok && !seen[k] {
+			seen[k] = true
+			calls = append(calls, k)
+		}
+		return true
+	})
+	return calls
+}
+
+// persistenceIOMethod returns the method name when c calls a method of a persistence store,
+// manager, queue or DB type; helpers and serializers in the same packages do not count.
+func persistenceIOMethod(p *packages.Package, c *ast.CallExpr) (string, bool) {
+	sel, ok := c.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return "", false
+	}
+	obj, ok := p.TypesInfo.Uses[sel.Sel].(*types.Func)
+	if !ok || obj.Pkg() == nil || !strings.HasPrefix(obj.Pkg().Path(), persistencePrefix) {
+		return "", false
+	}
+	sig, ok := obj.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil || !ioReceiver(sig.Recv().Type()) {
+		return "", false
+	}
+	return obj.Name(), true
 }
 
 // releaseOf returns where the hold that starts at lockPos ends: the first matching release that
@@ -200,28 +229,41 @@ func releaseOf(body *ast.BlockStmt, lockPos token.Pos, recv, release string) tok
 		in := false
 		for _, st := range b.List {
 			if st.Pos() <= lockPos && lockPos < st.End() {
-				if es, ok := st.(*ast.ExprStmt); ok && es.X.Pos() == lockPos {
-					in = true
-				} else if is, ok := st.(*ast.IfStmt); ok && is.Init != nil && is.Init.Pos() <= lockPos && lockPos < is.Init.End() {
-					in = true // if err := acquire(); err != nil { ... }
-				}
+				in = in || startsHold(st, lockPos)
 				continue
 			}
-			if !in {
-				continue
-			}
-			if es, ok := st.(*ast.ExprStmt); ok {
-				if c, ok := es.X.(*ast.CallExpr); ok {
-					if sel, ok := c.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == release && exprString(sel.X) == recv {
-						end = c.Pos()
-						return false
-					}
-				}
+			if in && isRelease(st, recv, release) {
+				end = st.Pos()
+				return false
 			}
 		}
 		return !in
 	})
 	return end
+}
+
+// startsHold reports whether st is the statement that takes the lock at lockPos: the acquire call
+// itself, or the init of an if (if err := acquire(); err != nil { ... }).
+func startsHold(st ast.Stmt, lockPos token.Pos) bool {
+	if es, ok := st.(*ast.ExprStmt); ok && es.X.Pos() == lockPos {
+		return true
+	}
+	is, ok := st.(*ast.IfStmt)
+	return ok && is.Init != nil && is.Init.Pos() <= lockPos && lockPos < is.Init.End()
+}
+
+// isRelease reports whether st is a call statement recv.release().
+func isRelease(st ast.Stmt, recv, release string) bool {
+	es, ok := st.(*ast.ExprStmt)
+	if !ok {
+		return false
+	}
+	c, ok := es.X.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := c.Fun.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == release && exprString(sel.X) == recv
 }
 
 func parentDefer(body *ast.BlockStmt, target ast.Node) (*ast.DeferStmt, bool) {

@@ -10,27 +10,144 @@ import (
 	"go/ast"
 	"go/types"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 
+	"go.temporal.io/server/cmd/tools/errorrules/internal/scan"
 	"golang.org/x/tools/go/packages"
 )
 
 const persistencePrefix = "go.temporal.io/server/common/persistence"
 
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2) // the scan itself is broken
+	}
+}
+
+// run scans the packages matching patterns and prints what it finds.
+func run(patterns []string) error {
+	pkgs, err := scan.Load(patterns)
+	if err != nil {
+		return err
+	}
+	var out []string
+	files := 0
+	for _, p := range pkgs {
+		if !strings.HasPrefix(p.PkgPath, "go.temporal.io/server") || strings.Contains(p.PkgPath, "/tools/") {
+			continue
+		}
+		n, found := scanPackage(p)
+		files += n
+		out = append(out, found...)
+	}
+	if err := scan.RequireScanned(files); err != nil {
+		return err
+	}
+	slices.Sort(out)
+	fmt.Printf("scanned %d files; %d persistence or RPC calls with a context that has no deadline\n\n", files, len(out))
+	for _, o := range out {
+		fmt.Println(o)
+	}
+	return nil
+}
+
+// scanPackage scans the package's production files and returns how many it scanned and the
+// calls it found.
+func scanPackage(p *packages.Package) (int, []string) {
+	files := 0
+	var out []string
+	for _, f := range p.Syntax {
+		name := p.Fset.Position(f.Pos()).Filename
+		if scan.IsTestFile(name) || isGenerated(name) {
+			continue
+		}
+		files++
+		for _, d := range f.Decls {
+			if fd, ok := d.(*ast.FuncDecl); ok && fd.Body != nil {
+				out = append(out, scanFunc(p, fd)...)
+			}
+		}
+	}
+	return files, out
+}
+
+func isGenerated(name string) bool {
+	return strings.HasSuffix(name, "_gen.go") || strings.HasSuffix(name, ".pb.go") || strings.HasSuffix(name, "_mock.go")
+}
+
+// scanFunc walks one function in source order, tracking which local variables hold a context
+// with no deadline, and reports each I/O call made with one.
+func scanFunc(p *packages.Package, fd *ast.FuncDecl) []string {
+	vars := map[string]bool{} // local name -> holds a context with no deadline
+	var out []string
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.AssignStmt:
+			trackAssign(s, vars)
+		case *ast.CallExpr:
+			if found, ok := checkCall(p, s, vars); ok {
+				out = append(out, found)
+			}
+		default:
+			// other nodes neither bind a context nor make a call
+		}
+		return true
+	})
+	return out
+}
+
+// trackAssign records whether each variable assigned by s now holds a context with no deadline.
+func trackAssign(s *ast.AssignStmt, vars map[string]bool) {
+	for i, l := range s.Lhs {
+		id, ok := l.(*ast.Ident)
+		if !ok {
+			continue
+		}
+		r := s.Rhs[0]
+		if len(s.Rhs) == len(s.Lhs) {
+			r = s.Rhs[i]
+		} else if i != 0 {
+			continue // ctx, cancel := context.WithCancel(...): only the first result
+		}
+		if noDeadline(r, vars) {
+			vars[id.Name] = true
+		} else if _, isCall := r.(*ast.CallExpr); isCall || len(s.Rhs) == len(s.Lhs) {
+			delete(vars, id.Name)
+		}
+	}
+}
+
+// checkCall reports a persistence or RPC call whose context argument has no deadline.
+func checkCall(p *packages.Package, s *ast.CallExpr, vars map[string]bool) (string, bool) {
+	sel, ok := s.Fun.(*ast.SelectorExpr)
+	if !ok || len(s.Args) == 0 {
+		return "", false
+	}
+	fn, ok := p.TypesInfo.Uses[sel.Sel].(*types.Func)
+	if !ok {
+		return "", false
+	}
+	kind, ok := ioMethod(fn)
+	if !ok || !noDeadline(s.Args[0], vars) {
+		return "", false
+	}
+	pos := scan.Pos(p.Fset.Position(s.Pos()))
+	return fmt.Sprintf("%s\t%s\t%s.%s", pos, kind, recvName(fn), fn.Name()), true
+}
+
+// ioMethod reports whether fn is a method that does I/O and takes a context first: a method on a
+// persistence manager, store or queue, or on a service RPC client.
 func ioMethod(fn *types.Func) (string, bool) {
-	sig, _ := fn.Type().(*types.Signature)
-	if sig == nil || sig.Recv() == nil || sig.Params().Len() == 0 {
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil || sig.Params().Len() == 0 {
 		return "", false
 	}
 	if t, ok := sig.Params().At(0).Type().(*types.Named); !ok || t.Obj().Name() != "Context" {
 		return "", false
 	}
-	rt := sig.Recv().Type()
-	if p, ok := rt.(*types.Pointer); ok {
-		rt = p.Elem()
-	}
-	n, ok := rt.(*types.Named)
+	n, ok := namedRecv(sig)
 	if !ok || n.Obj().Pkg() == nil {
 		return "", false
 	}
@@ -41,8 +158,9 @@ func ioMethod(fn *types.Func) (string, bool) {
 		return "persistence", true
 	case strings.HasSuffix(name, "ServiceClient"):
 		return "rpc", true
+	default:
+		return "", false
 	}
-	return "", false
 }
 
 // noDeadline reports whether e is a context with no deadline built in this function.
@@ -51,131 +169,50 @@ func noDeadline(e ast.Expr, vars map[string]bool) bool {
 	case *ast.Ident:
 		return vars[x.Name]
 	case *ast.CallExpr:
-		sel, ok := x.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return false
-		}
-		pkg, _ := sel.X.(*ast.Ident)
-		switch {
-		case pkg != nil && pkg.Name == "context" && (sel.Sel.Name == "Background" || sel.Sel.Name == "TODO"):
-			return true
-		case pkg != nil && pkg.Name == "context" && (sel.Sel.Name == "WithTimeout" || sel.Sel.Name == "WithDeadline" ||
-			sel.Sel.Name == "WithTimeoutCause" || sel.Sel.Name == "WithDeadlineCause"):
-			return false
-		case len(x.Args) > 0:
-			// WithCancel, WithValue, NewOutgoingContext, CopyContextValues...: inherit the deadline of
-			// their first context argument.
-			for _, a := range x.Args {
-				if noDeadline(a, vars) {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-func main() {
-	cfg := &packages.Config{
-		Mode:       packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
-		BuildFlags: []string{"-tags=disable_grpc_modules"},
-	}
-	pkgs, err := packages.Load(cfg, os.Args[1:]...)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
-	}
-	bad := 0
-	packages.Visit(pkgs, nil, func(p *packages.Package) {
-		for _, e := range p.Errors {
-			bad++
-			fmt.Fprintln(os.Stderr, "package error:", e)
-		}
-	})
-	if bad > 0 {
-		os.Exit(2)
-	}
-	var out []string
-	files := 0
-	for _, p := range pkgs {
-		if !strings.HasPrefix(p.PkgPath, "go.temporal.io/server") || strings.Contains(p.PkgPath, "/tools/") {
-			continue
-		}
-		for _, f := range p.Syntax {
-			name := p.Fset.Position(f.Pos()).Filename
-			if strings.HasSuffix(name, "_test.go") || strings.Contains(name, "/tests/") || strings.Contains(name, "/testing/") ||
-				strings.HasSuffix(name, "_gen.go") || strings.HasSuffix(name, ".pb.go") || strings.HasSuffix(name, "_mock.go") {
-				continue
-			}
-			files++
-			for _, d := range f.Decls {
-				fd, ok := d.(*ast.FuncDecl)
-				if !ok || fd.Body == nil {
-					continue
-				}
-				vars := map[string]bool{}
-				ast.Inspect(fd.Body, func(n ast.Node) bool {
-					switch s := n.(type) {
-					case *ast.AssignStmt:
-						for i, l := range s.Lhs {
-							id, ok := l.(*ast.Ident)
-							if !ok {
-								continue
-							}
-							r := s.Rhs[0]
-							if len(s.Rhs) == len(s.Lhs) {
-								r = s.Rhs[i]
-							} else if i != 0 {
-								continue // ctx, cancel := context.WithCancel(...): only the first result
-							}
-							if noDeadline(r, vars) {
-								vars[id.Name] = true
-							} else if _, isCall := r.(*ast.CallExpr); isCall || len(s.Rhs) == len(s.Lhs) {
-								delete(vars, id.Name)
-							}
-						}
-					case *ast.CallExpr:
-						sel, ok := s.Fun.(*ast.SelectorExpr)
-						if !ok || len(s.Args) == 0 {
-							return true
-						}
-						fn, ok := p.TypesInfo.Uses[sel.Sel].(*types.Func)
-						if !ok {
-							return true
-						}
-						kind, ok := ioMethod(fn)
-						if !ok || !noDeadline(s.Args[0], vars) {
-							return true
-						}
-						pos := p.Fset.Position(s.Pos())
-						file := pos.Filename
-						if i := strings.Index(file, "/temporal/"); i >= 0 {
-							file = file[i+len("/temporal/"):]
-						}
-						out = append(out, fmt.Sprintf("%s:%d\t%s\t%s.%s", file, pos.Line, kind, recvName(fn), fn.Name()))
-					}
-					return true
-				})
-			}
-		}
-	}
-	if files < 1000 {
-		fmt.Fprintf(os.Stderr, "suspiciously little scanned: %d files\n", files)
-		os.Exit(2)
-	}
-	sort.Strings(out)
-	fmt.Printf("scanned %d files; %d persistence or RPC calls with a context that has no deadline\n\n", files, len(out))
-	for _, o := range out {
-		fmt.Println(o)
+		return callHasNoDeadline(x, vars)
+	default:
+		return false
 	}
 }
 
-func recvName(fn *types.Func) string {
-	t := fn.Type().(*types.Signature).Recv().Type()
+// callHasNoDeadline reports whether a call builds a context with no deadline: context.Background
+// or TODO, or a wrapper over a context that has none. WithTimeout and WithDeadline add one.
+func callHasNoDeadline(x *ast.CallExpr, vars map[string]bool) bool {
+	sel, ok := x.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	pkg, isIdent := sel.X.(*ast.Ident)
+	fromContext := isIdent && pkg.Name == "context"
+	switch {
+	case fromContext && (sel.Sel.Name == "Background" || sel.Sel.Name == "TODO"):
+		return true
+	case fromContext && (sel.Sel.Name == "WithTimeout" || sel.Sel.Name == "WithDeadline" ||
+		sel.Sel.Name == "WithTimeoutCause" || sel.Sel.Name == "WithDeadlineCause"):
+		return false
+	default:
+		// WithCancel, WithValue, NewOutgoingContext, CopyContextValues...: inherit the deadline of
+		// their context argument.
+		return slices.ContainsFunc(x.Args, func(a ast.Expr) bool { return noDeadline(a, vars) })
+	}
+}
+
+// namedRecv returns the named type of a method's receiver, through a pointer.
+func namedRecv(sig *types.Signature) (*types.Named, bool) {
+	t := sig.Recv().Type()
 	if p, ok := t.(*types.Pointer); ok {
 		t = p.Elem()
 	}
-	if n, ok := t.(*types.Named); ok {
+	n, ok := t.(*types.Named)
+	return n, ok
+}
+
+func recvName(fn *types.Func) string {
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil {
+		return "?"
+	}
+	if n, ok := namedRecv(sig); ok {
 		return n.Obj().Name()
 	}
 	return "?"
