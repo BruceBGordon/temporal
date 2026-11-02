@@ -70,7 +70,7 @@ func TestNamespaceReplicationDLQAfterFullPurge(t *testing.T) {
 
 	visible := readAll()
 	if len(visible) == 1 {
-		t.Fatalf("STALE: the DLQ handler now sees a message sent after a full purge; update the ledger")
+		t.Fatal("STALE: the DLQ handler now sees a message sent after a full purge; update the ledger")
 	}
 	t.Logf("known gap: the DLQ handler sees %d messages; the new message (ID %d) is below the ack level (%d), "+
 		"so Read and Merge never return it", len(visible), raw[0].SourceTaskId, ackLevel)
