@@ -16,6 +16,7 @@ import (
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/persistence"
+	"go.temporal.io/server/common/testing/await"
 	"go.temporal.io/server/common/testing/parallelsuite"
 	"go.temporal.io/server/common/testing/taskpoller"
 	"go.temporal.io/server/common/testing/testvars"
@@ -69,7 +70,7 @@ func orphan(s *OrphanPointerProbeSuite, env *testcore.TestEnv, tv *testvars.Test
 		ShardID: shardID, NamespaceID: env.NamespaceID().String(), WorkflowID: tv.WorkflowID(),
 		RunID: startResp.RunId, ArchetypeID: chasm.WorkflowArchetypeID,
 	}))
-	waitForMutableStateGone(ctx, env, shardID, execMgr, tv.WorkflowID(), startResp.RunId)
+	waitForMutableStateGone(ctx, s.T(), env, shardID, execMgr, tv.WorkflowID(), startResp.RunId)
 	current, err := execMgr.GetCurrentExecution(ctx, &persistence.GetCurrentExecutionRequest{
 		ShardID: shardID, NamespaceID: env.NamespaceID().String(), WorkflowID: tv.WorkflowID(),
 		ArchetypeID: chasm.WorkflowArchetypeID,
@@ -152,10 +153,10 @@ func (s *OrphanPointerProbeSuite) probe(complete bool) {
 func (s *OrphanPointerProbeSuite) TestProbeCompletedRun() { s.probe(true) }
 func (s *OrphanPointerProbeSuite) TestProbeRunningRun()   { s.probe(false) }
 
-// waitForMutableStateGone is copied from tests/history_node_cleanup_test.go (this probe lives in its
-// own package so it compiles without the whole functional-test package).
-func waitForMutableStateGone(ctx context.Context, env *testcore.TestEnv, shardID int32, execMgr persistence.ExecutionManager, workflowID, runID string) {
-	env.Eventually(func() bool {
+// waitForMutableStateGone is adapted from tests/history_node_cleanup_test.go (this probe lives in its
+// own package so it compiles without the whole functional-test package), waiting with await.
+func waitForMutableStateGone(ctx context.Context, tb testing.TB, env *testcore.TestEnv, shardID int32, execMgr persistence.ExecutionManager, workflowID, runID string) {
+	await.RequireTruef(tb, func() bool {
 		_, err := execMgr.GetWorkflowExecution(ctx, &persistence.GetWorkflowExecutionRequest{
 			ShardID:     shardID,
 			NamespaceID: env.NamespaceID().String(),
