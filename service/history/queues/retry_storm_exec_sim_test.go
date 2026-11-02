@@ -393,6 +393,44 @@ func (s *execSim) startReload(sh int) {
 	s.schedule(execEvent{at: s.now, kind: 4, shard: sh, gen: s.gen[sh]})
 }
 
+// checkpoint models queueBase.checkpoint for one shard: ShrinkSlices, RangeCompleteHistoryTasks,
+// then (once enough tasks or time have passed) SetQueueState -> updateShardInfo -> UpdateShard,
+// retried with the checkpoint retry policy. An ambiguous write error makes the shard reload.
+func (s *execSim) checkpoint(sh int) {
+	p := s.p
+	next := s.vary(p.ackInterval)
+	if !s.reloading[sh] {
+		s.executed[sh] = 0                                             // ShrinkSlices: completed tasks leave memory regardless of what follows
+		if err := s.persistenceCall(s.ackLimiter, false); err != nil { // RangeCompleteHistoryTasks
+			s.res.failedCalls++
+			next = s.checkpointRetrier[sh].NextBackOff(err)
+		} else if s.tasksSinceUpdate[sh] >= p.shardUpdateMinTasks || s.now-s.lastShardUpdate[sh] >= p.shardUpdateMinInterval {
+			next = s.updateShardInfo(sh, next)
+		} else {
+			s.checkpointRetrier[sh].Reset()
+		}
+	}
+	s.schedule(execEvent{at: s.now + next, kind: 1, shard: sh})
+}
+
+// updateShardInfo persists the shard's queue position (UpdateShard) and returns the delay to the
+// next checkpoint: next on success, the retry backoff on failure.
+func (s *execSim) updateShardInfo(sh int, next time.Duration) time.Duration {
+	if err := s.persistenceCall(s.ackLimiter, true); err != nil {
+		s.res.failedCalls++
+		delay := s.checkpointRetrier[sh].NextBackOff(err)
+		if isAmbiguousWriteError(err) {
+			s.startReload(sh)
+		}
+		return delay
+	}
+	s.persisted[sh] = s.completed[sh]
+	s.tasksSinceUpdate[sh] = 0
+	s.lastShardUpdate[sh] = s.now
+	s.checkpointRetrier[sh].Reset()
+	return next
+}
+
 func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 	ctrl := gomock.NewController(t)
 	nsRegistry := namespace.NewMockRegistry(ctrl)
@@ -530,32 +568,7 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 			}
 			s.schedule(execEvent{at: s.now + s.vary(2*time.Millisecond) + next, kind: 0, shard: sh, gen: s.gen[sh]})
 		case 1: // queueBase.checkpoint
-			sh := e.shard
-			next := s.vary(p.ackInterval)
-			if !s.reloading[sh] {
-				s.executed[sh] = 0                                             // ShrinkSlices: completed tasks leave memory regardless of what follows
-				if err := s.persistenceCall(s.ackLimiter, false); err != nil { // RangeCompleteHistoryTasks
-					s.res.failedCalls++
-					next = s.checkpointRetrier[sh].NextBackOff(err)
-				} else if s.tasksSinceUpdate[sh] >= p.shardUpdateMinTasks || s.now-s.lastShardUpdate[sh] >= p.shardUpdateMinInterval {
-					// SetQueueState -> updateShardInfo -> UpdateShard
-					if err := s.persistenceCall(s.ackLimiter, true); err != nil {
-						s.res.failedCalls++
-						next = s.checkpointRetrier[sh].NextBackOff(err)
-						if isAmbiguousWriteError(err) {
-							s.startReload(sh)
-						}
-					} else {
-						s.persisted[sh] = s.completed[sh]
-						s.tasksSinceUpdate[sh] = 0
-						s.lastShardUpdate[sh] = s.now
-						s.checkpointRetrier[sh].Reset()
-					}
-				} else {
-					s.checkpointRetrier[sh].Reset()
-				}
-			}
-			s.schedule(execEvent{at: s.now + next, kind: 1, shard: sh})
+			s.checkpoint(e.shard)
 		case 5: // a workflow write through the shard (the source of the tasks)
 			sh := e.shard
 			if !s.reloading[sh] {
@@ -619,6 +632,8 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 			if !sched.TrySubmit(e.ex) {
 				s.schedule(execEvent{at: s.now + backoff.Jitter(2*time.Second, 0.5), kind: 3, ex: e.ex, gen: e.gen})
 			}
+		default:
+			t.Fatalf("unknown simulation event kind %d", e.kind)
 		}
 	}
 	for sh := range p.shards {

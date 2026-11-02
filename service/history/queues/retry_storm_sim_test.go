@@ -2,7 +2,6 @@ package queues
 
 import (
 	"container/heap"
-	"fmt"
 	"math/rand/v2"
 	"testing"
 	"time"
@@ -95,7 +94,7 @@ func (q *simQueue) Push(x any)          { *q = append(*q, x.(simEvent)) }
 func (q *simQueue) Pop() any            { o := *q; e := o[len(o)-1]; *q = o[:len(o)-1]; return e }
 func (q *simQueue) schedule(e simEvent) { heap.Push(q, e) }
 
-func runRetryStormSim(p simParams) simResult {
+func runRetryStormSim(t testing.TB, p simParams) simResult {
 	readLimiter := &tokenBucket{rate: p.limitPerSec, burst: p.burst, tokens: p.burst}
 	ackLimiter := readLimiter
 	if !p.sharedAckLimiter {
@@ -169,6 +168,8 @@ func runRetryStormSim(p simParams) simResult {
 				err = blip
 			case !readLimiter.take(now):
 				err = overloaded
+			default:
+				// within budget and no blip: the read goes ahead
 			}
 			if err != nil {
 				res.readErrors++
@@ -204,6 +205,8 @@ func runRetryStormSim(p simParams) simResult {
 				executed[s]++
 				q.schedule(simEvent{at: now + vary(p.execTime), shard: s, kind: 2})
 			}
+		default:
+			t.Fatalf("unknown simulation event kind %d", e.kind)
 		}
 	}
 	for _, b := range backlog {
@@ -242,21 +245,21 @@ func TestRetryStormSim(t *testing.T) {
 	// The model must be stable without a blip, or any "stall" it shows is the model's, not Temporal's.
 	calm := defaultSimParams()
 	calm.blipLength = 0
-	cr := runRetryStormSim(calm)
-	t.Log(fmt.Sprintf("no blip: final backlog %.0f, peak %.0f, read errors %d", cr.finalBacklog, cr.peakBacklog, cr.readErrors))
+	cr := runRetryStormSim(t, calm)
+	t.Logf("no blip: final backlog %.0f, peak %.0f, read errors %d", cr.finalBacklog, cr.peakBacklog, cr.readErrors)
 	if cr.finalBacklog > 10*float64(calm.shards*calm.batchSize) {
 		t.Fatalf("model is unstable without a blip (final backlog %.0f); results would be meaningless", cr.finalBacklog)
 	}
 	for _, shared := range []bool{true, false} {
 		p := defaultSimParams()
 		p.sharedAckLimiter = shared
-		r := runRetryStormSim(p)
+		r := runRetryStormSim(t, p)
 		recovered := "never (within 30m)"
 		if r.recoveredAfter >= 0 {
 			recovered = r.recoveredAfter.String()
 		}
-		t.Log(fmt.Sprintf("ack budget shared=%-5v  recovered after blip: %-18s  peak backlog: %8.0f  read errors: %7d  longest ack gap after blip: %v  final backlog: %.0f",
-			shared, recovered, r.peakBacklog, r.readErrors, r.ackStarvation, r.finalBacklog))
+		t.Logf("ack budget shared=%-5v  recovered after blip: %-18s  peak backlog: %8.0f  read errors: %7d  longest ack gap after blip: %v  final backlog: %.0f",
+			shared, recovered, r.peakBacklog, r.readErrors, r.ackStarvation, r.finalBacklog)
 	}
 }
 
@@ -272,7 +275,7 @@ func TestRetryStormSimSweep(t *testing.T) {
 				p.arrivalPerShard = util * p.limitPerSec / float64(p.shards)
 				p.blipLength = blipLen
 				p.seed = seed
-				r := runRetryStormSim(p)
+				r := runRetryStormSim(t, p)
 				if r.recoveredAfter < 0 {
 					never++
 				} else {
@@ -280,8 +283,8 @@ func TestRetryStormSimSweep(t *testing.T) {
 				}
 				errs += r.readErrors
 			}
-			t.Log(fmt.Sprintf("utilization %.0f%%  blip %-4v  worst recovery %-14v  never recovered %d/3  read errors (3 seeds) %d",
-				util*100, blipLen, worst.Round(time.Millisecond), never, errs))
+			t.Logf("utilization %.0f%%  blip %-4v  worst recovery %-14v  never recovered %d/3  read errors (3 seeds) %d",
+				util*100, blipLen, worst.Round(time.Millisecond), never, errs)
 		}
 	}
 }
