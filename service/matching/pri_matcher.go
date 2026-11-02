@@ -187,6 +187,7 @@ func (tm *priTaskMatcher) forwardTasks(lim quotas.RateLimiter, retrier backoff.R
 		skipLimiter, err = tm.forwardTask(res.task)
 
 		// backoff on resource exhausted errors
+		//transienterror:ignore err is from the forwarding RPC to the parent partition, not a persistence read
 		if common.IsResourceExhausted(err) {
 			util.InterruptibleSleep(tm.tqCtx, retrier.NextBackOff(err))
 		} else {
@@ -372,7 +373,7 @@ func (tm *priTaskMatcher) forwardPolls(
 			// 4× to allow for a few rounds plus propagation.
 			interval := cmp.Or(tm.config.EphemeralDataUpdateInterval(), time.Minute)
 			_ = util.InterruptibleSleep(ctx, 4*interval)
-		} else if common.IsResourceExhausted(err) {
+		} else if common.IsResourceExhausted(err) { //transienterror:ignore err is from the forwarding RPC to the parent partition, not a persistence read
 			// Rate limited: re-enqueue with forwarding still enabled so it retries.
 			tm.data.ReenqueuePollerIfNotMatched(poller)
 			_ = util.InterruptibleSleep(ctx, retrier.NextBackOff(err))

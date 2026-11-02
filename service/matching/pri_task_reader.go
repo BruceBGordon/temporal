@@ -26,6 +26,9 @@ import (
 
 const (
 	taskReaderThrottleRetryDelay = 3 * time.Second
+	// taskReaderThrottleRetryJitterCoefficient spreads throttle delays so that readers hit by
+	// the same persistence blip do not all retry at the same instant.
+	taskReaderThrottleRetryJitterCoefficient = 0.2
 
 	concurrentAddRetries = 10
 )
@@ -42,6 +45,8 @@ type (
 
 		backoffTimer *time.Timer
 		retrier      backoff.Retrier
+		// throttled is set by a ResourceExhausted read error and cleared by a successful read.
+		throttled bool
 
 		backlogAge backlogAgeTracker
 
@@ -177,14 +182,11 @@ func (tr *priTaskReader) getTasksPump() {
 		tr.backlogMgr.signalIfFatal(err)
 		if err != nil {
 			// TODO: Should we ever stop retrying on db errors?
-			if common.IsResourceExhausted(err) {
-				tr.backoffSignal(taskReaderThrottleRetryDelay)
-			} else {
-				tr.backoffSignal(tr.retrier.NextBackOff(err))
-			}
+			tr.backoffSignal(tr.readRetryDelay(err))
 			continue
 		}
 		tr.retrier.Reset()
+		tr.throttled = false
 
 		if len(batch.tasks) == 0 {
 			tr.setReadLevelAfterGap(batch.readLevel)
@@ -590,4 +592,20 @@ func (tr *priTaskReader) finalGC() {
 		return
 	}
 	_, _ = tr.doGCAt(ackLevel)
+}
+
+// readRetryDelay picks how long to wait before retrying a failed backlog read.
+//
+// While the reader is throttled for ResourceExhausted, an Unavailable blip (same
+// transient-persistence group, common.IsPersistenceTransientError) keeps the throttle delay
+// instead of switching to the fast retrier (same failure shape as issue #11547). The throttle
+// delay is jittered so readers do not retry in lockstep.
+func (tr *priTaskReader) readRetryDelay(err error) time.Duration {
+	if common.IsResourceExhausted(err) {
+		tr.throttled = true
+	}
+	if tr.throttled && common.IsPersistenceTransientError(err) {
+		return backoff.Jitter(taskReaderThrottleRetryDelay, taskReaderThrottleRetryJitterCoefficient)
+	}
+	return tr.retrier.NextBackOff(err)
 }

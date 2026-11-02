@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 
@@ -50,10 +51,10 @@ func (m *sqlExecutionStore) AppendHistoryNodes(
 
 	if !request.IsNewBranch {
 		_, err = m.DB.InsertIntoHistoryNode(ctx, nodeRow)
-		switch err {
-		case nil:
+		switch {
+		case err == nil:
 			return nil
-		case context.DeadlineExceeded, context.Canceled:
+		case isContextTimeoutOrCancel(err):
 			return &p.AppendHistoryTimeoutError{
 				Msg: err.Error(),
 			}
@@ -88,8 +89,8 @@ func (m *sqlExecutionStore) AppendHistoryNodes(
 		}
 
 		result, err = tx.InsertIntoHistoryTree(ctx, treeRow)
-		switch err {
-		case nil:
+		switch {
+		case err == nil:
 			rowsAffected, err = result.RowsAffected()
 			if err != nil {
 				return err
@@ -98,7 +99,7 @@ func (m *sqlExecutionStore) AppendHistoryNodes(
 				return fmt.Errorf("expected 1 or 2 rows to be affected for tree table as we allow upserts, got %v", rowsAffected)
 			}
 			return nil
-		case context.DeadlineExceeded, context.Canceled:
+		case isContextTimeoutOrCancel(err):
 			return &p.AppendHistoryTimeoutError{
 				Msg: err.Error(),
 			}
@@ -475,4 +476,10 @@ func (m *sqlExecutionStore) GetHistoryTreeContainingBranch(
 	return &p.InternalGetHistoryTreeContainingBranchResponse{
 		TreeInfos: treeInfos,
 	}, nil
+}
+
+// isContextTimeoutOrCancel reports a context deadline or cancellation, also when the driver wraps
+// it (pgx returns *pgconn.errTimeout wrapping context.DeadlineExceeded).
+func isContextTimeoutOrCancel(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
