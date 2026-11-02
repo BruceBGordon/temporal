@@ -4,7 +4,6 @@ import (
 	"context"
 	stdsql "database/sql"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -171,7 +170,7 @@ func TestAppendHistoryTimeoutIsRetryable(t *testing.T) {
 			store := &sqlExecutionStore{SqlStore: NewSQLStore(c.db, log.NewNoopLogger(), nil)}
 			err := store.AppendHistoryNodes(context.Background(), appendRequest(c.new))
 			var timeoutErr *p.AppendHistoryTimeoutError
-			require.Truef(t, errors.As(err, &timeoutErr),
+			require.ErrorAsf(t, err, &timeoutErr,
 				"got %T (%v): persistence.OperationPossiblySucceeded=%v, so the shard would re-acquire",
 				err, err, p.OperationPossiblySucceeded(err))
 		})
