@@ -19,6 +19,7 @@
 package transienterrorcheck
 
 import (
+	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
@@ -32,7 +33,7 @@ import (
 const (
 	commonPkg        = "go.temporal.io/server/common"
 	serviceErrorPkg  = "go.temporal.io/api/serviceerror"
-	directive        = "//transienterror:ignore"
+	directivePrefix  = "//transienterror:ignore"
 	splitCheck       = "IsResourceExhausted"
 	wholeGroupCheck  = "IsPersistenceTransientError"
 	otherGroupMember = "Unavailable"
@@ -46,86 +47,113 @@ var Analyzer = &analysis.Analyzer{
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	ins := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
-
-	type directiveInfo struct {
-		pos  token.Pos
-		used bool
+	ins, ok := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+	if !ok {
+		return nil, fmt.Errorf("%s: inspect result has type %T, want *inspector.Inspector", pass.Analyzer.Name, pass.ResultOf[inspect.Analyzer])
 	}
-	directives := map[string]map[int]*directiveInfo{} // file -> line -> directive
+	directives := collectDirectives(pass)
+	ins.Preorder([]ast.Node{(*ast.FuncDecl)(nil), (*ast.FuncLit)(nil)}, func(n ast.Node) {
+		checkFunc(pass, n, directives)
+	})
+	directives.reportUnused(pass)
+	return nil, nil
+}
+
+// directive is one //transienterror:ignore comment, and whether it suppressed a finding.
+type directive struct {
+	pos  token.Pos
+	used bool
+}
+
+// directiveSet holds the package's exceptions, by file and line.
+type directiveSet map[string]map[int]*directive
+
+// collectDirectives finds every exception comment in the package, reporting any without a reason.
+func collectDirectives(pass *analysis.Pass) directiveSet {
+	ds := directiveSet{}
 	for _, f := range pass.Files {
 		for _, group := range f.Comments {
 			for _, c := range group.List {
-				if !strings.HasPrefix(c.Text, directive) {
+				if !strings.HasPrefix(c.Text, directivePrefix) {
 					continue
 				}
-				if strings.TrimSpace(strings.TrimPrefix(c.Text, directive)) == "" {
-					pass.Reportf(c.Pos(), "%s needs a reason", directive)
+				if strings.TrimSpace(strings.TrimPrefix(c.Text, directivePrefix)) == "" {
+					pass.Reportf(c.Pos(), "%s needs a reason", directivePrefix)
 				}
 				p := pass.Fset.Position(c.Pos())
-				if directives[p.Filename] == nil {
-					directives[p.Filename] = map[int]*directiveInfo{}
+				if ds[p.Filename] == nil {
+					ds[p.Filename] = map[int]*directive{}
 				}
-				directives[p.Filename][p.Line] = &directiveInfo{pos: c.Pos()}
+				ds[p.Filename][p.Line] = &directive{pos: c.Pos()}
 			}
 		}
 	}
-	exempted := func(pos token.Pos) bool {
-		p := pass.Fset.Position(pos)
-		for _, line := range []int{p.Line, p.Line - 1} {
-			if d := directives[p.Filename][line]; d != nil {
-				d.used = true
-				return true
-			}
-		}
-		return false
-	}
+	return ds
+}
 
-	ins.Preorder([]ast.Node{(*ast.FuncDecl)(nil), (*ast.FuncLit)(nil)}, func(n ast.Node) {
-		var body *ast.BlockStmt
-		switch fn := n.(type) {
-		case *ast.FuncDecl:
-			body = fn.Body
-		case *ast.FuncLit:
-			body = fn.Body
-		}
-		if body == nil || coversWholeGroup(pass, body) {
-			return
-		}
-		// The rule is about production retry paths; tests may deliberately retry on one error.
-		if strings.HasSuffix(pass.Fset.Position(n.Pos()).Filename, "_test.go") {
-			return
-		}
-		ast.Inspect(body, func(n ast.Node) bool {
-			if _, ok := n.(*ast.FuncLit); ok {
-				return false // checked on its own, with its own body
-			}
-			ifStmt, ok := n.(*ast.IfStmt)
-			if !ok || !callsCommon(pass, ifStmt.Cond, splitCheck) {
-				return true
-			}
-			if exempted(ifStmt.Pos()) {
-				return true
-			}
-			effect := "branches on it"
-			if computesTime(pass, ifStmt.Body) || (ifStmt.Else != nil && computesTime(pass, ifStmt.Else)) {
-				effect = "chooses a delay with it"
-			}
-			pass.Reportf(ifStmt.Pos(),
-				"%s %s but never considers %s (same group in common.%s): a blip can bypass overload protection",
-				"common."+splitCheck, effect, "serviceerror."+otherGroupMember, wholeGroupCheck)
+// exempts reports whether an exception sits on the line of pos or the line above, and marks it used.
+func (ds directiveSet) exempts(pass *analysis.Pass, pos token.Pos) bool {
+	p := pass.Fset.Position(pos)
+	for _, line := range []int{p.Line, p.Line - 1} {
+		if d := ds[p.Filename][line]; d != nil {
+			d.used = true
 			return true
-		})
-	})
+		}
+	}
+	return false
+}
 
-	for _, lines := range directives {
+// reportUnused reports every exception that suppressed nothing, so exceptions cannot rot.
+func (ds directiveSet) reportUnused(pass *analysis.Pass) {
+	for _, lines := range ds {
 		for _, d := range lines {
 			if !d.used {
-				pass.Reportf(d.pos, "%s does not suppress anything; remove it", directive)
+				pass.Reportf(d.pos, "%s does not suppress anything; remove it", directivePrefix)
 			}
 		}
 	}
-	return nil, nil
+}
+
+// funcBody returns the body of a function declaration or literal, or nil for anything else.
+func funcBody(n ast.Node) *ast.BlockStmt {
+	switch fn := n.(type) {
+	case *ast.FuncDecl:
+		return fn.Body
+	case *ast.FuncLit:
+		return fn.Body
+	default:
+		return nil
+	}
+}
+
+// checkFunc reports each if statement in one function that branches on common.IsResourceExhausted
+// while the function never considers the rest of the group.
+func checkFunc(pass *analysis.Pass, n ast.Node, directives directiveSet) {
+	body := funcBody(n)
+	if body == nil || coversWholeGroup(pass, body) {
+		return
+	}
+	// The rule is about production retry paths; tests may deliberately retry on one error.
+	if strings.HasSuffix(pass.Fset.Position(n.Pos()).Filename, "_test.go") {
+		return
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false // checked on its own, with its own body
+		}
+		ifStmt, ok := n.(*ast.IfStmt)
+		if !ok || !callsCommon(pass, ifStmt.Cond, splitCheck) || directives.exempts(pass, ifStmt.Pos()) {
+			return true
+		}
+		effect := "branches on it"
+		if computesTime(pass, ifStmt.Body) || (ifStmt.Else != nil && computesTime(pass, ifStmt.Else)) {
+			effect = "chooses a delay with it"
+		}
+		pass.Reportf(ifStmt.Pos(),
+			"%s %s but never considers %s (same group in common.%s): a blip can bypass overload protection",
+			"common."+splitCheck, effect, "serviceerror."+otherGroupMember, wholeGroupCheck)
+		return true
+	})
 }
 
 // coversWholeGroup reports whether body calls common.IsPersistenceTransientError or refers to
@@ -138,10 +166,7 @@ func coversWholeGroup(pass *analysis.Pass, body *ast.BlockStmt) bool {
 		}
 		if id, ok := n.(*ast.Ident); ok {
 			obj := pass.TypesInfo.Uses[id]
-			switch {
-			case isObj(obj, commonPkg, wholeGroupCheck):
-				found = true
-			case isObj(obj, serviceErrorPkg, otherGroupMember):
+			if isObj(obj, commonPkg, wholeGroupCheck) || isObj(obj, serviceErrorPkg, otherGroupMember) {
 				found = true
 			}
 		}
@@ -165,6 +190,8 @@ func callsCommon(pass *analysis.Pass, expr ast.Expr, name string) bool {
 			id = fun
 		case *ast.SelectorExpr:
 			id = fun.Sel
+		default:
+			return true // a call through a value or expression: not a named function
 		}
 		if id != nil && isObj(pass.TypesInfo.Uses[id], commonPkg, name) {
 			found = true
