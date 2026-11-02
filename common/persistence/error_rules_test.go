@@ -32,31 +32,37 @@ import (
 )
 
 type namedErr struct {
-	name string
-	err  error
+	name    string
+	err     error
+	timeout bool // the database timed out (whatever the error says)
 }
 
 // errorCatalog is what persistence and its callers really see. It covers every error the fault
-// injector can produce (faultinjection/fault.go newFault), the timeout the real stores return
-// (cassandra/gocql/errors.go ConvertError -> persistence.TimeoutError), the rate limiter's error
+// injector can produce (faultinjection/fault.go newFault), the timeouts each store returns
+// (Cassandra: cassandra/gocql/errors.go ConvertError -> persistence.TimeoutError; SQL, the
+// #11547 incident's store: a transaction wraps the context deadline with %w, sql/common.go
+// convertSQLError, and a call outside a transaction formats it into an Unavailable with %v,
+// e.g. sql/execution_tasks.go GetHistoryTasks), the rate limiter's error
 // (persistence_rate_limited_clients.go), and the context errors.
 func errorCatalog() []namedErr {
 	return []namedErr{
-		{"Unavailable", serviceerror.NewUnavailable("x")},
-		{"ResourceExhausted(system, persistence limit)", persistence.ErrPersistenceSystemLimitExceeded},
-		{"ResourceExhausted(system, overloaded)", &serviceerror.ResourceExhausted{Cause: enumspb.RESOURCE_EXHAUSTED_CAUSE_SYSTEM_OVERLOADED, Scope: enumspb.RESOURCE_EXHAUSTED_SCOPE_SYSTEM, Message: "x"}},
-		{"ResourceExhausted(namespace)", persistence.ErrPersistenceNamespaceLimitExceeded},
-		{"persistence.TimeoutError", &persistence.TimeoutError{Msg: "x"}},
-		{"persistence.AppendHistoryTimeoutError", &persistence.AppendHistoryTimeoutError{Msg: "x"}},
-		{"serviceerror.DeadlineExceeded", serviceerror.NewDeadlineExceeded("x")},
-		{"context.DeadlineExceeded", context.DeadlineExceeded},
-		{"serviceerror.Canceled", serviceerror.NewCanceled("x")},
-		{"context.Canceled", context.Canceled},
-		{"DataLoss", serviceerror.NewDataLoss("x")},
-		{"Internal", serviceerror.NewInternal("x")},
-		{"NotFound", serviceerror.NewNotFound("x")},
-		{"ConditionFailedError", &persistence.ConditionFailedError{Msg: "x"}},
-		{"ShardOwnershipLostError", &persistence.ShardOwnershipLostError{Msg: "x"}},
+		{"Unavailable", serviceerror.NewUnavailable("x"), false},
+		{"ResourceExhausted(system, persistence limit)", persistence.ErrPersistenceSystemLimitExceeded, false},
+		{"ResourceExhausted(system, overloaded)", &serviceerror.ResourceExhausted{Cause: enumspb.RESOURCE_EXHAUSTED_CAUSE_SYSTEM_OVERLOADED, Scope: enumspb.RESOURCE_EXHAUSTED_SCOPE_SYSTEM, Message: "x"}, false},
+		{"ResourceExhausted(namespace)", persistence.ErrPersistenceNamespaceLimitExceeded, false},
+		{"persistence.TimeoutError (Cassandra timeout)", &persistence.TimeoutError{Msg: "x"}, true},
+		{"SQL transaction timeout (wrapped deadline)", fmt.Errorf("UpdateShard: %w", context.DeadlineExceeded), true},
+		{"SQL read timeout (Unavailable, cause formatted away)", serviceerror.NewUnavailablef("GetHistoryTasks operation failed. Select failed. Error: %v", context.DeadlineExceeded), true},
+		{"persistence.AppendHistoryTimeoutError", &persistence.AppendHistoryTimeoutError{Msg: "x"}, true},
+		{"serviceerror.DeadlineExceeded", serviceerror.NewDeadlineExceeded("x"), true},
+		{"context.DeadlineExceeded", context.DeadlineExceeded, true},
+		{"serviceerror.Canceled", serviceerror.NewCanceled("x"), false},
+		{"context.Canceled", context.Canceled, false},
+		{"DataLoss", serviceerror.NewDataLoss("x"), false},
+		{"Internal", serviceerror.NewInternal("x"), false},
+		{"NotFound", serviceerror.NewNotFound("x"), false},
+		{"ConditionFailedError", &persistence.ConditionFailedError{Msg: "x"}, false},
+		{"ShardOwnershipLostError", &persistence.ShardOwnershipLostError{Msg: "x"}, false},
 	}
 }
 
@@ -97,58 +103,71 @@ func isCancellation(err error) bool { return common.IsContextCanceledErr(err) }
 // holds says whether the declarations agree about it.
 type rule struct {
 	id, statement  string
-	applies, holds func(err error) bool
+	applies, holds func(c namedErr) bool
 }
+
+// on adapts a predicate on the error to a rule's signature.
+func on(f func(error) bool) func(namedErr) bool { return func(c namedErr) bool { return f(c.err) } }
 
 var rules = []rule{
 	{
 		id:        "same-name",
 		statement: "Two functions named IsPersistenceTransientError mean the same thing",
-		applies:   func(error) bool { return true },
-		holds: func(e error) bool {
+		applies:   func(namedErr) bool { return true },
+		holds: on(func(e error) bool {
 			return common.IsPersistenceTransientError(e) == persistenceclient.IsPersistenceTransientError(e)
-		},
+		}),
 	},
 	{
 		id:        "unhealthy-is-throttled",
 		statement: "An error the health signal counts as persistence being unhealthy is backed off by the queue retry paths",
-		applies:   func(e error) bool { return persistence.IsUnhealthyErrorForTest(e) && !isCancellation(e) },
-		holds:     common.IsPersistenceTransientError,
+		applies:   on(func(e error) bool { return persistence.IsUnhealthyErrorForTest(e) && !isCancellation(e) }),
+		holds:     on(common.IsPersistenceTransientError),
 	},
 	{
 		id:        "expensive-recovery-is-throttled",
 		statement: "A load-related error that makes the shard re-acquire (ambiguous write) is backed off by the queue retry paths",
-		applies: func(e error) bool {
+		applies: on(func(e error) bool {
 			loadRelated := common.IsPersistenceTransientError(e) || persistence.IsUnhealthyErrorForTest(e)
 			return persistence.OperationPossiblySucceeded(e) && loadRelated && !isCancellation(e)
-		},
-		holds: common.IsPersistenceTransientError,
+		}),
+		holds: on(common.IsPersistenceTransientError),
 	},
 	{
 		id:        "helper-throttles-whole-group",
 		statement: "backoff.ThrottleRetryContext gives every member of the transient group the throttle backoff it gives ResourceExhausted",
-		applies:   common.IsPersistenceTransientError,
-		holds:     throttledByRetryHelper,
+		applies:   on(common.IsPersistenceTransientError),
+		holds:     on(throttledByRetryHelper),
+	},
+	{
+		id:        "health-signal-sees-timeouts",
+		statement: "A database timeout counts toward the health signal (it drives the adaptive persistence limiter)",
+		applies:   func(c namedErr) bool { return c.timeout },
+		holds:     on(persistence.IsUnhealthyErrorForTest),
 	},
 }
 
 // knownGaps are the triaged findings: rule id + error name -> why it is listed.
 var knownGaps = map[string]string{
-	"same-name|ResourceExhausted(system, persistence limit)": "candidate: the client layer must not retry the limiter's own rejection; the shared name hides that the two groups differ",
-	"same-name|ResourceExhausted(system, overloaded)":        "candidate: same as above",
-	"same-name|ResourceExhausted(namespace)":                 "candidate: same as above",
-	"same-name|DataLoss":                                     "candidate: client layer retries read-after-write DataLoss (comment in factory.go); queue paths do not",
+	"same-name|ResourceExhausted(system, persistence limit)": "by design (an inner retry on overload would amplify it); listed so the difference is pinned and the shared name stops hiding it",
+	"same-name|ResourceExhausted(system, overloaded)":        "by design (same as above)",
+	"same-name|ResourceExhausted(namespace)":                 "by design (same as above)",
+	"same-name|DataLoss":                                     "by design (factory.go comment: read-after-write DataLoss); pinned",
 
-	"unhealthy-is-throttled|persistence.TimeoutError":              "FINDING (hypothesis 4): the real store timeout counts as unhealthy but is retried without the throttle backoff",
-	"unhealthy-is-throttled|persistence.AppendHistoryTimeoutError": "candidate: counted unhealthy; not in the transient group",
-	"unhealthy-is-throttled|serviceerror.DeadlineExceeded":         "candidate: counted unhealthy; not in the transient group",
-	"unhealthy-is-throttled|context.DeadlineExceeded":              "candidate: counted unhealthy; not in the transient group",
+	"unhealthy-is-throttled|persistence.TimeoutError (Cassandra timeout)": "FINDING (hypothesis 4): counted unhealthy, but gets no throttle, and the executable resets its overload history on it",
+	"unhealthy-is-throttled|persistence.AppendHistoryTimeoutError":        "candidate: counted unhealthy; not in the transient group",
+	"unhealthy-is-throttled|serviceerror.DeadlineExceeded":                "candidate: counted unhealthy; not in the transient group",
+	"unhealthy-is-throttled|context.DeadlineExceeded":                     "candidate: counted unhealthy; not in the transient group",
 
-	"expensive-recovery-is-throttled|persistence.TimeoutError":      "FINDING (hypothesis 4): each timeout can make the shard re-acquire and redo work, and nothing backs it off",
-	"expensive-recovery-is-throttled|serviceerror.DeadlineExceeded": "candidate: same mechanism if a deadline error reaches the shard",
-	"expensive-recovery-is-throttled|context.DeadlineExceeded":      "candidate: same mechanism if a deadline error reaches the shard",
+	"expensive-recovery-is-throttled|persistence.TimeoutError (Cassandra timeout)": "FINDING (hypothesis 4): each timeout can make the shard re-acquire and redo work, and nothing backs it off",
+	"expensive-recovery-is-throttled|serviceerror.DeadlineExceeded":                "candidate: same mechanism if a deadline error reaches the shard",
+	"expensive-recovery-is-throttled|context.DeadlineExceeded":                     "candidate: same mechanism if a deadline error reaches the shard",
 
-	"helper-throttles-whole-group|Unavailable": "FINDING (#11547 class, library level): ThrottleRetryContext throttles only ResourceExhausted; 450+ call sites inherit the split",
+	"unhealthy-is-throttled|SQL transaction timeout (wrapped deadline)":                 "FINDING (hypothesis 4 on SQL): a transaction timeout counts as unhealthy but is outside the transient group",
+	"expensive-recovery-is-throttled|SQL transaction timeout (wrapped deadline)":        "FINDING (hypothesis 4 on SQL): a transaction timeout makes the shard re-acquire, with no throttle",
+	"health-signal-sees-timeouts|SQL read timeout (Unavailable, cause formatted away)":  "FINDING: on SQL a read timeout becomes an Unavailable with the cause formatted away (%v), so the health signal, and the adaptive limiter it drives, cannot see it",
+	"helper-throttles-whole-group|SQL read timeout (Unavailable, cause formatted away)": "same as Unavailable below",
+	"helper-throttles-whole-group|Unavailable":                                          "candidate (design question): ThrottleRetryContext throttles only ResourceExhausted (its own TODO notes this); its callers are mostly RPC clients, where a fast retry on Unavailable may be intended",
 }
 
 func TestErrorRulesAgree(t *testing.T) {
@@ -181,11 +200,11 @@ func TestErrorRulesAgree(t *testing.T) {
 	for _, r := range rules {
 		applied := 0
 		for _, c := range cat {
-			if !r.applies(c.err) {
+			if !r.applies(c) {
 				continue
 			}
 			applied++
-			if !r.holds(c.err) {
+			if !r.holds(c) {
 				found[r.id+"|"+c.name] = true
 			}
 		}
@@ -215,7 +234,8 @@ func TestErrorRulesAgree(t *testing.T) {
 
 // TestErrorRulesUnderWrapping reports (does not fail) which declarations change their answer
 // when an error is wrapped with %w. Type switches see only the outer type; errors.As sees
-// through. Persistence paths do not wrap today, so this is latent: it matters the day one does.
+// through. The SQL stores already wrap context deadline and cancel errors (convertSQLError); the
+// catalog's SQL transaction timeout shows the effect. Other wrapping is latent.
 func TestErrorRulesUnderWrapping(t *testing.T) {
 	for _, p := range predicates {
 		var changed []string
