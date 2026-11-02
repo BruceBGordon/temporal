@@ -18,7 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -217,7 +217,7 @@ func TestErrorRulesAgree(t *testing.T) {
 	for k := range found {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	for _, k := range keys {
 		if why, ok := knownGaps[k]; ok {
 			t.Logf("known gap  %-70s %s", k, why)
