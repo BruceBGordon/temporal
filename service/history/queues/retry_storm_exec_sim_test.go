@@ -89,6 +89,12 @@ type execSimParams struct {
 	// default) with this ErrorThreshold, an operator choice. Everything else uses the real
 	// defaults (dynamicconfig.DefaultDynamicRateLimitingParams). Hypothesis 6.
 	healthErrorThreshold float64
+	// sqlBackend shapes database timeouts the way the SQL stores return them (the #11547 incident
+	// ran on Aurora PostgreSQL): a call outside a transaction (reads, range deletes,
+	// GetOrCreateShard) returns Unavailable with the cause formatted away; a transaction (shard
+	// updates, workflow writes, txExecute) returns the context deadline wrapped with %w
+	// (sql/common.go convertSQLError). Otherwise timeouts are Cassandra's persistence.TimeoutError.
+	sqlBackend bool
 }
 
 func defaultExecSimParams() execSimParams {
@@ -212,8 +218,8 @@ func (s *execSim) inBlip() bool {
 // in its own transient group (persistenceclient.IsPersistenceTransientError) under the real policy
 // (common.CreatePersistenceClientRetryPolicy). Approximation: the retry's 50ms wait is not modeled;
 // the extra attempt is charged at the same instant.
-func (s *execSim) persistenceCall(l *tokenBucket) error {
-	err := s.persistenceAttempt(l)
+func (s *execSim) persistenceCall(l *tokenBucket, tx bool) error {
+	err := s.persistenceAttempt(l, tx)
 	if !s.p.clientRetry {
 		return err
 	}
@@ -223,7 +229,7 @@ func (s *execSim) persistenceCall(l *tokenBucket) error {
 			break
 		}
 		s.res.clientRetries++
-		err = s.persistenceAttempt(l)
+		err = s.persistenceAttempt(l, tx)
 	}
 	return err
 }
@@ -231,11 +237,13 @@ func (s *execSim) persistenceCall(l *tokenBucket) error {
 // persistenceAttempt decides the outcome of one attempt at the current virtual time, and records
 // it in the health signal window the way the metrics client does (persistence.isUnhealthyError
 // counts the store's TimeoutError; Unavailable and ResourceExhausted count as healthy).
-func (s *execSim) persistenceAttempt(l *tokenBucket) error {
-	err := s.persistenceOutcome(l)
+func (s *execSim) persistenceAttempt(l *tokenBucket, tx bool) error {
+	err := s.persistenceOutcome(l, tx)
 	s.hCalls++
+	// persistence.isUnhealthyError (unexported): the store's TimeoutError, or a context deadline
+	// (errors.Is, so wrapped ones count); Unavailable and ResourceExhausted count as healthy.
 	var te *persistence.TimeoutError
-	if errors.As(err, &te) {
+	if errors.As(err, &te) || common.IsContextDeadlineExceededErr(err) {
 		s.hUnhealthy++
 	}
 	return err
@@ -262,7 +270,7 @@ func (s *execSim) refreshHealthLimiter() {
 	s.limiter.tokens = min(s.limiter.tokens, s.limiter.burst)
 }
 
-func (s *execSim) persistenceOutcome(l *tokenBucket) error {
+func (s *execSim) persistenceOutcome(l *tokenBucket, tx bool) error {
 	switch {
 	case s.inBlip():
 		return serviceerror.NewUnavailable("database failover")
@@ -274,7 +282,13 @@ func (s *execSim) persistenceOutcome(l *tokenBucket) error {
 		}
 	case s.db != nil && !s.db.take(s.now):
 		s.res.timeouts++
-		// The real stores convert timeouts to persistence.TimeoutError
+		switch {
+		case s.p.sqlBackend && tx:
+			return fmt.Errorf("UpdateWorkflowExecution: %w", context.DeadlineExceeded)
+		case s.p.sqlBackend:
+			return serviceerror.NewUnavailablef("GetHistoryTasks operation failed. Select failed. Error: %v", context.DeadlineExceeded)
+		}
+		// Cassandra converts timeouts to persistence.TimeoutError
 		// (nosqlplugin/cassandra/gocql/errors.go ConvertError).
 		return &persistence.TimeoutError{Msg: "persistence call timed out"}
 	}
@@ -287,10 +301,11 @@ type simExecutor struct{ s *execSim }
 
 func (x simExecutor) Execute(_ context.Context, e Executable) ExecuteResponse {
 	x.s.res.execAttempts++
-	err := x.s.persistenceCall(x.s.limiter)
+	write := x.s.p.writeFraction > 0 && x.s.rng.Float64() < x.s.p.writeFraction
+	err := x.s.persistenceCall(x.s.limiter, write)
 	if err != nil {
 		x.s.res.failedCalls++
-		if x.s.p.writeFraction > 0 && x.s.rng.Float64() < x.s.p.writeFraction && isAmbiguousWriteError(err) {
+		if write && isAmbiguousWriteError(err) {
 			x.s.startReload(x.s.shardOf[e])
 		}
 	}
@@ -491,7 +506,7 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 				s.schedule(execEvent{at: s.now + p.pollBackoff, kind: 0, shard: sh, gen: s.gen[sh]})
 				continue
 			}
-			if err := s.persistenceCall(s.limiter); err != nil {
+			if err := s.persistenceCall(s.limiter, false); err != nil {
 				s.res.failedCalls++
 				s.schedule(execEvent{at: s.now + readerRetryDelay(err, s.retriers[sh]), kind: 0, shard: sh, gen: s.gen[sh]})
 				continue
@@ -518,13 +533,13 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 			sh := e.shard
 			next := s.vary(p.ackInterval)
 			if !s.reloading[sh] {
-				s.executed[sh] = 0                                      // ShrinkSlices: completed tasks leave memory regardless of what follows
-				if err := s.persistenceCall(s.ackLimiter); err != nil { // RangeCompleteHistoryTasks
+				s.executed[sh] = 0                                             // ShrinkSlices: completed tasks leave memory regardless of what follows
+				if err := s.persistenceCall(s.ackLimiter, false); err != nil { // RangeCompleteHistoryTasks
 					s.res.failedCalls++
 					next = s.checkpointRetrier[sh].NextBackOff(err)
 				} else if s.tasksSinceUpdate[sh] >= p.shardUpdateMinTasks || s.now-s.lastShardUpdate[sh] >= p.shardUpdateMinInterval {
 					// SetQueueState -> updateShardInfo -> UpdateShard
-					if err := s.persistenceCall(s.ackLimiter); err != nil {
+					if err := s.persistenceCall(s.ackLimiter, true); err != nil {
 						s.res.failedCalls++
 						next = s.checkpointRetrier[sh].NextBackOff(err)
 						if isAmbiguousWriteError(err) {
@@ -544,7 +559,7 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 		case 5: // a workflow write through the shard (the source of the tasks)
 			sh := e.shard
 			if !s.reloading[sh] {
-				if err := s.persistenceCall(s.limiter); err != nil {
+				if err := s.persistenceCall(s.limiter, true); err != nil {
 					s.res.failedWrites++
 					if isAmbiguousWriteError(err) {
 						s.startReload(sh)
@@ -557,9 +572,9 @@ func runExecRetryStormSim(t *testing.T, p execSimParams) execSimResult {
 			if e.gen != s.gen[sh] {
 				continue
 			}
-			err := s.persistenceCall(s.limiter)
+			err := s.persistenceCall(s.limiter, false)
 			if err == nil {
-				err = s.persistenceCall(s.limiter)
+				err = s.persistenceCall(s.limiter, true)
 			}
 			if err != nil {
 				s.res.failedCalls++
@@ -897,7 +912,8 @@ func TestClientRetryLayerHypothesis(t *testing.T) {
 	}
 }
 
-// TestAdaptiveLimiterHypothesis tests hypothesis 6: the server already has a mitigation for the
+// TestAdaptiveLimiterHypothesis (Cassandra-shaped errors; TestPostgresShapedHypotheses has the
+// SQL version, where the limiter mostly does not fire) tests hypothesis 6: the server already has a mitigation for the
 // hypothesis 4 loop, the health-based adaptive limiter, off by default. When the share of calls
 // that time out passes an operator-chosen threshold, it lowers the limiter (real defaults: by 0.3
 // per 10s, to no lower than 0.8x), so overflow becomes ResourceExhausted ("not written", no
@@ -955,4 +971,59 @@ func TestAdaptiveLimiterHypothesis(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPostgresShapedHypotheses reruns hypotheses 4 and 6 with the database errors shaped as the
+// SQL stores return them, because the #11547 incident ran on Aurora PostgreSQL: a timeout outside
+// a transaction is Unavailable (in the transient group, so the fix throttles it; the health signal
+// ignores it), and a transaction timeout is a wrapped context deadline (outside the group; the
+// shard treats it as ambiguous; the health signal counts it). Report-only.
+func TestPostgresShapedHypotheses(t *testing.T) {
+	run := func(t *testing.T, label string, util, dbFactor float64, blip time.Duration, threshold float64) {
+		base := defaultExecSimParams()
+		base.shardReload, base.apiWrites, base.horizon = true, true, 30*time.Minute
+		base.sqlBackend, base.divergeAt = true, 200_000
+		base.dbCapacity = dbFactor * base.limitPerSec
+		base.arrivalPerShard = util * base.dbCapacity / float64(base.shards) / 2
+		base.healthErrorThreshold = threshold
+		calm := base
+		calm.blipLength = 0
+		if cr := runExecRetryStormSim(t, calm); cr.reloads > 0 || cr.finalOutstanding > float64(4*calm.batchSize*calm.shards) {
+			t.Logf("%-58s: baseline unstable; skipped", label)
+			return
+		}
+		worst, never, diverged, reloads, timeouts, minMult := time.Duration(0), 0, 0, 0, 0, 1.0
+		for seed := uint64(1); seed <= 3; seed++ {
+			p := base
+			p.blipLength, p.seed = blip, seed
+			r := runExecRetryStormSim(t, p)
+			switch {
+			case r.divergedAt > 0:
+				diverged++
+			case r.recoveredAfter < 0:
+				never++
+			default:
+				worst = max(worst, r.recoveredAfter)
+			}
+			reloads += r.reloads
+			timeouts += r.timeouts
+			minMult = min(minMult, r.minMultiplier)
+		}
+		t.Logf("%-58s: worst recovery %-8v NEVER(30m) %d/3  DIVERGED %d/3  reloads %5d  timeouts %7d  lowest multiplier %.1f",
+			label, worst.Round(time.Second), never, diverged, reloads, timeouts, minMult)
+	}
+	// Load is a fraction of what the DATABASE can serve, so every row is stable without a blip;
+	// the database is a fraction of what the limiter admits (the gap the assumption is about).
+	t.Run("gap sweep", func(t *testing.T) {
+		for _, db := range []float64{0.97, 0.85, 0.70, 0.50} {
+			for _, blip := range []time.Duration{30 * time.Second, 60 * time.Second} {
+				run(t, fmt.Sprintf("DB %3.0f%% of limiter, load 90%% of DB, blip %v", db*100, blip), 0.90, db, blip, 0)
+			}
+		}
+	})
+	t.Run("adaptive limiter", func(t *testing.T) {
+		for _, threshold := range []float64{0, 0.001, 0.003, 0.01} {
+			run(t, fmt.Sprintf("DB 97%%, load 90%% of DB, 60s blip, limiter threshold %.3f", threshold), 0.90, 0.97, 60*time.Second, threshold)
+		}
+	})
 }
